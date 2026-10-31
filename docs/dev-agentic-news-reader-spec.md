@@ -41,7 +41,7 @@
   - Ausstehende Bestätigungen unabhängig davon dauerhaft verfolgen, ob die ID später noch in einer Ungelesen-Abfrage auftaucht; nach mehrdeutigem Antwort-/Netzwerkfehler den tatsächlichen Zustand prüfen und bei Bedarf erneut bestätigen.
   - Ein fehlgeschlagenes Teilstück oder ein Absturz darf keine bereits gespeicherten persönlichen Zustände verlieren. Bestätigungs- und Pagination-Verhalten der eingesetzten FreshRSS-Version vor Liveeinsatz verifizieren.
 - **AC3 – Ausführung:** Zeitplan standardmäßig alle vier Stunden, in Settings veränderbar und abschaltbar; manueller Start in der UI.
-  - Keine zwei Läufe gleichzeitig; ein manueller Start bei laufender Pipeline zeigt den bestehenden Lauf statt einen weiteren zu erzeugen.
+  - Keine zwei FreshRSS-Importläufe gleichzeitig; ein manueller Start bei laufendem Import zeigt den bestehenden Lauf statt einen weiteren zu erzeugen. Artikeljobs älterer Importe dürfen begrenzt weiterlaufen; lange Transkriptionen und Budgetpausen blockieren nicht den nächsten Import.
   - Die UI zeigt Fortschritt sowie ausstehende, erfolgreiche und fehlgeschlagene Verarbeitung.
   - Gespeicherter DB-Zustand und fertige Ergebnisse überleben einen Neustart. Offene Schritte dürfen erneut laufen; keine komplexe Durable-Execution-Lösung als Selbstzweck und keine Garantie exakt einmaliger externer KI-Aufrufe bei Absturz.
 
@@ -53,10 +53,12 @@
   - Vollständigkeitseinschätzung ist heuristisch, kein Beweis für Vollständigkeit.
 - **AC5 – Video:** Vorhandene Transkripte/Untertitel bevorzugen; sonst Audio herunterladen und automatisch transkribieren. Transkript ist der inhaltliche Ausgangspunkt für Video-Scores und Zusammenfassung.
   - Videos ohne verfügbares Transkript und ohne erfolgreiche Transkription bleiben mit Fehler und Retry sichtbar; kein erfundener Inhalt.
-  - Werkzeug und Transkriptionsmodell konfigurierbar bzw. als Implementierungsentscheidung; `yt-dlp` und Transkription sind Kandidaten, keine Garantie für Zugriff auf jedes Video.
+  - Zeitliches Ziel: innerhalb von vier Stunden ab dauerhafter Übernahme in die App Transkript, Qualitätsstatus, Kategorie, Schlagwörter und aktive Scores bereitstellen; Queue-Wartezeit zählt mit. Zeit bis zum FreshRSS-Import liegt davor. Zielerreichung unter repräsentativer Last nachweisen, nicht aufgrund der Hardwaredaten behaupten; Fehler und Pausen nicht als fertigen Erfolg zählen.
+  - `yt-dlp` für Untertitel beziehungsweise Audio und `ffmpeg` zur Audioaufbereitung; keine Garantie für Zugriff auf jedes Video. Lokale CPU-Transkription bevorzugen und auf der Zielhardware prüfen; Modell konfigurierbar. API-Transkription nur nach expliziter Konfiguration als Alternative, kein stillschweigender Wechsel mit Kosten oder Audio-Datenweitergabe.
 - **AC6 – Verarbeitung einzelner Einträge:** Kategorie, Schlagwörter und Scores folgen auf die erforderliche Aufbereitung; Schlagwörter stehen vor Score-Aufrufen zur Verfügung.
   - Ausstehende, unvollständige oder fehlgeschlagene Einträge bleiben sichtbar. Eine Bewertung auf eingeschränkter Grundlage muss als solche erkennbar sein; nicht vorhandene Scores bleiben leer statt einen Ersatzwert zu erfinden.
   - Ein defekter Artikel blockiert nicht alle anderen Artikel des Laufs.
+  - Bei überschrittenem Modellkontext Inhalte automatisch segmentieren und aufgabenbezogen verdichten/aggregieren; vollständigen Ausgangstext erhalten. Abdeckung nachvollziehbar machen und verdichtete Bewertungsgrundlage kennzeichnen. Kein stilles Abschneiden oder pauschaler Mittelwert von Chunk-Scores; zusätzliche Aufrufe unterliegen den Nutzungslimits.
 
 ### Kategorien und Schlagwörter
 
@@ -86,12 +88,14 @@
   - Ein Vote je Artikel/Ziel; ändern, entfernen bzw. neutralisieren möglich. Jede explizite Voting-Aktion aktualisiert das Vote-Datum, auch bei erneuter Wahl desselben Werts. Kein eigener Artikel-Daumen und keine unmittelbare automatische Neubewertung.
   - Settings zeigen pro Schlagwort und Quelle positive/negative Votes, aktuelles Gewicht und manuelle Korrektur; Suche und Sortierung unterstützen die Verwaltung.
 - **AC13 – Zeitgewichtung:** Gesamtgewicht eines Ziels = manuelle Korrektur plus Summe zeitgewichteter Votes. Neuere Votes zählen stärker; der manuelle Offset altert nicht.
-  - Halbwertszeit konfigurierbar, Default **drei Monate**. Nach einer Halbwertszeit zählt ein unveränderter Vote halb so stark; neutral trägt null bei.
-  - Konkrete Definition der Einheit „Monat“, genaue Kurve zwischen Halbwertspunkten und Darstellung großer Gewichte sind als Implementierungsvorschlag zu präzisieren. Rohwerte nicht stillschweigend kappen oder Rankings verfälschen.
+  - Halbwertszeit konfigurierbar, Default **90 Tage (drei mal 30 Tage)**, nicht Kalendermonate. Ein Tag entspricht 24 Stunden vergangener Zeit.
+  - Kontinuierlicher exponentieller Verfall: `Gewicht = manueller Offset + Summe(Vote * 2^(-Alter_in_Tagen / Halbwertszeit_in_Tagen))`. Nach einer Halbwertszeit zählt ein unveränderter Vote halb so stark; neutral trägt null bei.
+  - Große Gewichte verständlich darstellen. Rohwerte nicht stillschweigend kappen oder Rankings durch Anzeigeformatierung verfälschen.
 
 ### Oberfläche und Aktionen
 
-- **AC14 – Reader:** Responsive Weboberfläche für Desktop und Smartphone, klassische Liste, standardmäßig ungelesene Einträge nach Signal absteigend. Wird der Standard-Sortierscore entfernt, automatisch nach Datum sortieren.
+- **AC14 – Reader:** Responsive und mobiloptimierte Weboberfläche als installierbare Progressive Web App (PWA) für Desktop und Smartphone; klassische Liste, standardmäßig ungelesene Einträge nach Signal absteigend. Wird der Standard-Sortierscore entfernt, automatisch nach Datum sortieren.
+  - Online-first: App-Grundgerüst lokal zwischenspeichern und bei fehlender Verbindung einen klaren Offline-Hinweis anzeigen. Kein dauerhafter lokaler Artikelcache und keine Offline-Schreibwarteschlange; Artikelzugriff, Chat und Aktionen benötigen eine Verbindung zum Server.
   - Sortierung nach aktiven Scores und Datum; Titel-Sortierung als bestätigte Option nach Bedarf. Sortierung gilt über die gesamte gefilterte Ergebnismenge, nicht nur über eine geladene Seite.
   - Filter nach Kategorie, Quelle, gelesen/ungelesen, Artikel/Video und Verarbeitungsstatus; Textsuche nach Titel. Niedrig bewertete Artikel nicht automatisch ausblenden.
   - Gelesen markieren entfernt den Artikel aus der Standardansicht; gelesene Artikel bleiben auffindbar und können wieder ungelesen gesetzt werden. Keine automatische Löschung im ersten Wurf.
@@ -110,14 +114,16 @@
 
 ### KI, Betrieb und Sicherheitsgrenzen
 
-- **AC19 – Pi und Modelle:** Integration über Pi SDK oder Pi Durable bzw. passende Pi-Modell-Schnittstellen; Auswahl mit geringstem erforderlichem Overhead. Für jede Aufgabe – Kategorie, Qualitätsprüfung, Schlagwörter, Scores, Extraktionsagent, Zusammenfassung, Chat, Transkription – ein Modell bzw. passender konfigurierbarer Dienst. Ein Modell kann mehrere Aufgaben erfüllen.
+- **AC19 – Pi und Modelle:** Direkte Pi-AI-Aufrufe für Classifier und reguläre Modellaufgaben; Pi Coding-Agent SDK für Chat und agentische Inhaltsextraktion. Keine zusätzliche Pi-Durable-Schicht; Jobausführung und Wiederholungen übernimmt pg-boss. Für jede Aufgabe – Kategorie, Qualitätsprüfung, Schlagwörter, Scores, Extraktionsagent, Kontextverdichtung, Zusammenfassung, Chat, Transkription – ein Modell bzw. passender konfigurierbarer Dienst. Ein Modell kann mehrere Aufgaben erfüllen.
+  - Für Classifier `typesafe/jev-latest` direkt bei TypeSafe mit `TYPESAFE_API_KEY` verwenden; Containerzugriff und Kompatibilität praktisch verifizieren. Konfiguration je Aufgabe bleibt änderbar.
   - Optionales explizites Pi-Fallback-Modell; ohne Konfiguration kein stillschweigender Fallback. Fehler und nicht unterstützte Aufgabentypen sichtbar melden. Verwendete Modellanbieter/Datenweitergabe erkennbar machen.
-  - Technische Authentifizierung von Pi im Container gemäß verifizierter SDK-/Provider-Unterstützung; keine im Browser oder Repository offengelegten Secrets. Ob ein Live-Login in der App sinnvoll und unterstützt ist, steht noch nicht fest.
+  - Technische Authentifizierung von Pi im Container gemäß verifizierter SDK-/Provider-Unterstützung; keine im Browser oder Repository offengelegten Secrets. OAuth einschließlich OpenAI Codex zunächst extern provisionieren, ohne eigene Login-UI in der Anwendung. Ein einfacher containergeeigneter Einrichtungsablauf und die Token-Erneuerung sind praktisch zu verifizieren.
 - **AC20 – Limits:** Automatische LLM-Verarbeitung, interaktive LLM-Aufrufe und Transkription getrennt begrenzbar; Classifier separat und großzügig konfigurierbar.
-  - Laufende und ausstehende Arbeit bei Erreichen eines Limits sichtbar pausieren statt Artikel zu verlieren. Wo Kosten nicht verlässlich verfügbar sind, ergänzende konfigurierbare Aufruf-/Nutzungslimits anwenden. Konkrete Default-Zahlen sind Vorschläge, keine bestätigten Werte.
+  - Laufende und ausstehende Arbeit bei Erreichen eines Limits sichtbar pausieren statt Artikel zu verlieren. Wo Kosten nicht verlässlich verfügbar sind, ergänzende konfigurierbare Aufruf-/Nutzungslimits anwenden. Wiederholungen zählen mit. Audio-Minuten lokal erfassen und optional begrenzen; keine pauschale Tagesquote oder Videolängengrenze im Standard. Parallelität, temporären Speicher und hängende Prozesse trotzdem begrenzen. Keine Eurogarantie bei unbekannten Kosten. Konkrete Startwerte vor einem größeren Erstlauf festlegen; Default-Zahlen sind noch nicht bestätigt.
 - **AC21 – Architektur und Betrieb:** Anwendung nach Clean Architecture schneiden: Geschäftsregeln unabhängig von UI, Persistenz und konkreten externen Adaptern. Docker-Image plus separate PostgreSQL-Datenbank; dauerhafte Daten und Pi-Sessions müssen Neustart und Wiederherstellung überstehen.
   - Zugangsschutz ist explizit eine Infrastrukturvoraussetzung: nur über das private VPN; kein eingebautes Anwendungskonto erforderlich. Ein ungeschützt öffentlich exponierter Dienst ist außerhalb des vorgesehenen Betriebsmodells. Betreiber verantwortet VPN, Infrastruktur und Backups.
   - DB-Zustand und Pi-Session-Speicher im Backup erfassen; reine Sicherung eines Container-Images enthält keine persistenten Daten. Konsistente PostgreSQL-Sicherung und Wiederherstellung müssen praktisch nachgewiesen werden.
+  - Artikel- und Agenten-Seitenabruf nur zu öffentlichen HTTP(S)-Zielen; private Netze, localhost und Cloud-Metadaten auch bei Weiterleitungen sperren. Private Endpunkte nur über separat konfigurierte Integrationen erreichen, nicht über fremde Artikel-/Agenten-URLs.
   - Browser, API und Agenten verarbeiten fremde Inhalte als untrusted data; keine Shell oder Secret-Weitergabe an Agenten, eingeschränkte Netzwerkzugriffe und sichere Darstellung. Privat/VPN bedeutet nicht, dass externe Modellanbieter keine Artikeltexte sehen.
 
 ## Vorschläge für Startprompts und Modellrollen
@@ -146,22 +152,24 @@ Die folgenden Texte sind bewusst **erste Vorschläge**, keine behauptet erprobte
 ## Erforderliche Evidenz vor Freigabe einer Implementierung
 
 - **AC1–AC3:** isolierte FreshRSS- und DB-Prüfung inklusive mehrerer Seiten, Einträgen, die während des Laufs hinzukommen, wiederholtem Import, Fehler zwischen DB-Commit und Read-Markierung sowie Wiederanlauf. Keine pauschale Lesemarkierung.
-- **AC4–AC6:** repräsentative Originalartikel, Paywall/Fehlerseite, vollständige und unvollständige Extraktion, Videos mit und ohne Untertitel, Transkriptionsfehler und unabhängige Weiterverarbeitung anderer Einträge.
+- **AC4–AC6:** repräsentative Originalartikel, Paywall/Fehlerseite, vollständige und unvollständige Extraktion, Videos mit und ohne Untertitel, Transkriptionsfehler und unabhängige Weiterverarbeitung anderer Einträge. Vier-Stunden-Ziel für Videos ab Import bis zu aktiven Scores unter repräsentativer Last inklusive Queue und Modellarbeit prüfen.
 - **AC7–AC13:** frei konfigurierbare Scores, Kategorie-Fallback, fehlende Scores, Vote-Änderung und -Alterung, manuelle Offsets, Merge-Kollisionen einschließlich mehr als zwei Begriffen und erneute Bewertung; Wirkung von Feedback anhand echter Beispiele prüfen, nicht nur Prompt-Weitergabe.
-- **AC14–AC18:** globale Sortierung über mehrere Seiten, Desktop/Phone, gespeicherter Lesestatus/Summary, Karakeep-Fehler, Mail-API-Idempotenz und Pi-Session-Restore. Mail-Versand selbst ist nicht Bestandteil dieses Systems.
+- **AC14–AC18:** globale Sortierung über mehrere Seiten, Desktop/Phone inklusive mobiloptimierter Bedienung und PWA-Installation in unterstützten Browsern, gespeicherter Lesestatus/Summary, Karakeep-Fehler, Mail-API-Idempotenz und Pi-Session-Restore. Mail-Versand selbst ist nicht Bestandteil dieses Systems.
 - **AC19–AC21:** Modell- und Provider-Konfiguration ohne Secret-Leak, begrenzte Tools und fehlender Fallback, Limit-Pausierung, isolierter Docker-/PostgreSQL-Neustart, konsistentes Backup und Wiederherstellung inklusive Pi-Sessions; keine behauptete Sicherheit nur aufgrund von Docker/VPN.
 
 ## Offene technische Prüfungen und Entscheidungen
 
-- Pi SDK: konkrete Credential-Bereitstellung, persistentes Session-Volume und Restore im gewählten Container praktisch prüfen; Entscheidung, ob externe Provisionierung genügt oder später eine sichere interaktive OAuth-Oberfläche gebraucht wird.
+- Pi SDK: einfachen externen OAuth-Einrichtungsablauf für OpenAI Codex, Token-Erneuerung, persistentes Session-Volume und Restore im gewählten Container praktisch prüfen; keine eigene Login-UI im ersten Wurf.
 - FreshRSS: tatsächliche laufende Version, API-Pagination und ID-/Read-Markierung je ID, Retry-Semantik und Verträglichkeit mit dem bestehenden Favoriten-Job read-only bzw. isoliert prüfen.
-- Pi-Classifier: genutzte Pi-Version, konkrete Provider- und Modellverfügbarkeit sowie Fehler- und Kostenverhalten praktisch prüfen; freie Schlagworterzeugung über reguläres LLM als Startvorschlag.
-- Drei Monate als Halbwertszeit: exakte Einheit und mathematische Kurve so festlegen, dass sie mit dem erklärten Verhalten übereinstimmt. Große Gewichte und manuelle Offsets sollen verständlich bleiben.
+- Pi-Classifier: `typesafe/jev-latest` über `TYPESAFE_API_KEY` aus dem Container praktisch prüfen, einschließlich Kontextgrenzen, Fehler- und Kostenverhalten. Freie Schlagworterzeugung und nötige Kontextverdichtung erfolgen über reguläres LLM.
+- Große Präferenzgewichte und manuelle Offsets verständlich darstellen, ohne Rohwerte oder Rankings stillschweigend zu kappen; Einheit und Verfallsformel sind in AC13 festgelegt.
 - Konkrete Provider/Modelle, Default-Budgets, Modellzugriff und mögliche zusätzliche Dienste für Transkription; technische Bereitstellung, Datenschutz und Lizenz-/Kostenfolgen prüfen.
 - Karakeep-API: Duplicate-/Retry-Verhalten und zulässige Konfiguration testen; keine bestehenden Bookmarks verändern.
 
 ## Quellen
 
+- [Bestätigte Architekturentscheidungen und offene Architekturfragen](architecture.md).
+- [Technische Skizze für Datenmodell, API, Verarbeitung und Pilotlimits](technical-design.md): Vorschläge und offene Rückfragen, keine zusätzlichen stillschweigend bestätigten Anforderungen.
 - [Projektkontext und Entscheidungen](dev-agentic-news-reader.md).
 - [IndyDevDan: Pi Durable News Agent](https://github.com/disler/pi-durable-news-agent) und [HFS-Definition auf fixiertem Stand](https://github.com/disler/pi-durable-news-agent/blob/273b79bb8d3d8907cae9fbd6abd3da163ee2a343/apps/dna-server-api/prompt_engineering/jev/hfs/command.json): Inspiration für Bewertungen; keine Verpflichtung zu Gewichten, Filtern oder Architektur der Vorlage.
 - [Pi AI SDK](https://raw.githubusercontent.com/earendil-works/pi/main/packages/ai/README.md), [Pi SDK](https://pi.dev/docs/latest/sdk.md), [Pi Security](https://pi.dev/docs/latest/security.md): Integration, Auth und Sicherheitsgrenzen; Kompatibilität mit tatsächlich verwendeter Version prüfen.
