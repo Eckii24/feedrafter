@@ -1,0 +1,9 @@
+[
+  {
+    "items": [{ "id": "9007199254740993123", "title": "Synthetic first item", "origin": { "streamId": "feed/synthetic", "title": "Synthetic feed" } }],
+    "continuation": "fixture-next+/="
+  },
+  {
+    "items": [{ "id": "002", "title": "Synthetic second item" }]
+  }
+]

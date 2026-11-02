@@ -1,0 +1,67 @@
+{
+  "name": "feedrafter",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.21.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && vite build",
+    "start": "node dist/server/main.js serve",
+    "db:migrate": "node dist/server/main.js migrate",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.web.json",
+    "lint": "eslint src tests",
+    "test:unit": "vitest run tests/unit",
+    "test:integration": "vitest run tests/integration tests/api",
+    "test:live": "vitest run --config vitest.live.config.ts",
+    "test:e2e": "playwright test",
+    "build:foundation": "tsc -p tsconfig.build.json",
+    "import:provision": "node dist/server/import-main.js --provision",
+    "import:worker": "node dist/server/import-main.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@fastify/static": "10.1.8",
+    "@fastify/swagger": "9.9.2",
+    "@fastify/type-provider-typebox": "6.3.0",
+    "@mozilla/readability": "0.6.0",
+    "ajv-formats": "3.0.1",
+    "drizzle-orm": "0.45.4",
+    "fastify": "5.12.7",
+    "ipaddr.js": "2.5.0",
+    "linkedom": "0.18.14",
+    "pg": "8.23.1",
+    "pg-boss": "12.38.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "typebox": "1.3.27"
+  },
+  "overrides": {
+    "undici": "8.12.3",
+    "glob": "14.0.2",
+    "minimatch": "11.0.1"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.64.1",
+    "@tailwindcss/vite": "4.3.3",
+    "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "drizzle-kit": "0.31.11",
+    "eslint": "10.13.0",
+    "tailwindcss": "4.3.3",
+    "tsx": "4.23.15",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vite": "8.3.5",
+    "vite-plugin-pwa": "2.0.0",
+    "vitest": "5.0.5",
+    "workbox-build": "7.4.1",
+    "workbox-window": "7.4.1"
+  }
+}

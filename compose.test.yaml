@@ -1,0 +1,17 @@
+# Disposable local test database only. Never use for production or real data.
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: disposable-test-only
+      POSTGRES_DB: feedrafter_test
+    ports:
+      - "127.0.0.1:55432:5432"
+    tmpfs:
+      - /var/lib/postgresql:size=512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d feedrafter_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30

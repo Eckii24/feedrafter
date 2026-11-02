@@ -10,6 +10,7 @@
   - Admit every model request through PostgreSQL budgets; disable hidden provider retries and cache warming.
   - Use no-key DuckDuckGo HTML search with Bing RSS fallback, following the inspected personal extension without loading it.
   - Preserve successful results during retries; expose missing, stale, partial, paused, and failed work explicitly.
+  - Adopt C1's explicitly user-approved Pi dependency/root-override exception after isolated compatibility evaluation; this enables C11 continuation, not completion or production approval.
 - **Unchanged / excluded:** Existing FreshRSS favorites/digest workflow; no mail sender, public login, semantic/URL deduplication, score-based hiding, offline article storage, browser-based extraction, or generic plugin framework.
 - **Material risks:** Real FreshRSS/Karakeep behavior, container OAuth, SDK request accounting, media egress, and target-host video capacity require isolated proofs.
   - Failed gates stop the affected delivery; no silent fallback, weaker security boundary, paid transcription, or relaxed four-hour target.
@@ -22,7 +23,7 @@
 
 | ID | File / area | Planned change and purpose |
 | --- | --- | --- |
-| C1 | `package.json`, `package-lock.json`, `.node-version`, `.npmrc`, `tsconfig{,.server,.web}.json`, `eslint.config.js`, `vite.config.ts`, `vitest.{unit,integration,live}.config.ts`, `playwright.config.ts`, `.gitignore` (new) | Establish pinned build/test tooling, strict server/browser boundaries, and reproducible scripts. |
+| C1 | `package.json`, `package-lock.json`, `.node-version`, `.npmrc`, `tsconfig{,.server,.web}.json`, `eslint.config.js`, `vite.config.ts`, `vitest.{unit,integration,live}.config.ts`, `playwright.config.ts`, `.gitignore` (new) | Establish pinned build/test tooling, strict server/browser boundaries, reproducible scripts, and C11-enabling Pi pins/root overrides under C1's user-approved exception; preserve npm policy. |
 | C2 | `src/server/{main,composition-root,config,cli}.ts`, `src/server/domain/{article,processing,errors,clock}.ts`, `src/shared/{common,article,processing}.ts` (new) | Define bootstrap, pure foundational types, clock/error contracts, and runtime-validated public DTOs. |
 | C3 | `src/server/adapters/postgres/{client,migrate,import-store,reader-store,task-store}.ts`, `src/server/adapters/postgres/schema/{index,import,processing}.ts`, `drizzle.config.ts`, `drizzle/*_import.sql` (new) | Persist import identity, read state, acknowledgements, settings, runs/tasks, and initial constraints/indexes. |
 | C4 | `src/server/application/{start-import,run-import,recover-processing}.ts`, `src/server/ports/{unit-of-work,import-store,task-queue,freshrss}.ts`, `src/server/adapters/jobs/{runner,queues,freshrss-coordinator}.ts` (new) | Coordinate one import, transactional enqueue, scheduling, bounded retry, fencing, and restart recovery. |
@@ -87,7 +88,6 @@
 - **Package pins verified through npm metadata:**
   - Fastify `5.12.7`; `@fastify/static` `10.1.8`; `@fastify/swagger` `9.9.2`; `@fastify/type-provider-typebox` `6.3.0`; `typebox` `1.3.27`.
   - Drizzle ORM `0.45.4`, Drizzle Kit `0.31.11`, `pg` `8.23.1`, pg-boss `12.38.0`.
-  - Pi coding-agent and Pi AI `1.4.0` together; do not mix generations or depend on globally installed Pi.
   - React/React DOM `19.3.1`, Vite `8.3.5`, React Vite plugin `6.1.2`, Tailwind and its Vite plugin `4.3.3`, PWA plugin `2.0.0`.
   - Mozilla Readability `0.6.0`, linkedom `0.18.14`, `ipaddr.js` `2.5.0`, `react-markdown` `10.1.0`.
   - TypeScript `6.0.3`, Vitest `5.0.5`, Playwright `1.64.1`, ESLint `10.13.0`, typescript-eslint `8.72.1`. ESLint 10.13.0 was published 2026-10-16 and its Node engine admits 24.21.0; typescript-eslint 8.72.1 accepts ESLint `^10.0.0` and TypeScript `>=4.8.4 <6.1.0` (npm registry metadata, checked 2026-10-31). The 10.14.0 pin was too recent for the configured 72-hour npm age gate.
@@ -99,6 +99,26 @@
   - `build` compiles server/CLI and UI; `start` runs the built CLI's `serve` command.
   - `test:integration` includes `tests/integration` and `tests/api`; `test:live` includes only `tests/live` and is excluded from normal CI.
   - Use React Testing Library for interaction tests if needed; Playwright covers full UI flows. No existing test pattern is available to extend.
+- **User-approved C1 dependency exception enabling C11 — adopt/continue:** User explicitly chose adoption/continue after the isolated compatibility evaluation recorded in Verification.
+  - Merge this fragment into root `package.json`, preserving unrelated entries; record matching exact resolutions in `package-lock.json`. Do not mix Pi generations or depend on globally installed Pi.
+
+  ```json
+  {
+    "dependencies": {
+      "@earendil-works/pi-ai": "1.4.0",
+      "@earendil-works/pi-coding-agent": "1.4.0"
+    },
+    "overrides": {
+      "undici": "8.12.3",
+      "glob": "14.0.2",
+      "minimatch": "11.0.1"
+    }
+  }
+  ```
+
+  - **Rationale:** Official advisory evidence from the evaluation identifies fixed versions as `undici >=8.12.2` for both examined findings, `glob 14.0.2`, and `minimatch 11.0.1`. The selected overrides meet those fixed-version thresholds.
+  - **Explicit exception:** These root overrides supersede at least some declared dependency ranges. User approval accepts this specific compatibility risk; do not treat it as implicit range compatibility or blanket approval for other overrides.
+  - **Policy unchanged:** Preserve `.npmrc` byte-for-byte: `save-exact=true`, `min-release-age=3`, `ignore-scripts=true`. No `--force`, `--legacy-peer-deps`, or other policy changes/bypasses.
 - **References:** AC21 / V1, V2.
 
 ### C2–C3 — Foundational contracts and persistence
@@ -140,7 +160,7 @@
 - **Ordered import:**
   1. `startImport(contextId)` transaction returns an existing active run or creates exactly one run and pg-boss job.
   2. A dedicated coordinator connection holds a PostgreSQL session advisory lock for the context across fetch and acknowledgement; all acknowledgement retries use this same coordinator.
-  3. Fetch pages sequentially. In each transaction insert new identities, preserve existing article/personal/result fields, persist ack intent, create eligible processing records, and enqueue the first executable article task with `fromDrizzle`.
+  3. Fetch pages sequentially. In each transaction insert new identities, preserve existing article/personal/result fields, and persist ack intent. For each delivery, create and enqueue processing work only for capabilities delivered there: D1 creates no article-processing task; starting in D2, create eligible per-article tasks and enqueue their first executable job atomically with page persistence using `fromDrizzle`. Do not create placeholder/no-op tasks or backfill D1 entries automatically when D2 arrives.
   4. During the entire fetch phase perform **no** read acknowledgement, including old retries. Any page/commit failure ends the scan as incomplete; no acknowledgements from that incomplete scan.
   5. Only after complete pagination, durably record completion and make saved IDs eligible. Reconcile/retry pending acknowledgements, including IDs absent from the current unread response; acknowledge only known-durable IDs.
   6. Bound acknowledgement attempts, retain remaining intents, and finish the import run with explicit pending/error counts. Do not hold the import open forever waiting for unavailable FreshRSS.
@@ -172,7 +192,7 @@
   - D1 default date descending; D2 default Signal descending while that definition is active, otherwise date descending. Signal uses a stable seeded ID, not its editable name.
   - Apply all predicates and ordering in SQL before limit. Title search is literal case-insensitive substring; escape `%`/`_` and parameterize SQL.
   - Score ordering: numeric value in selected direction, `NULLS LAST`, then sort date descending and UUID descending. Date/title order likewise ends in deterministic date/UUID tie-breakers.
-  - Versioned base64url cursor includes query fingerprint, sort key including null placement, date and UUID. Validate structure/types/filter match; never interpolate it as SQL. Reject inactive/deleted explicit score sorts.
+  - Opaque versioned base64url cursor binds the query fingerprint, sort position including null placement, date and UUID. It may reference a stored title by UUID and hash rather than embed an unbounded title; reject a changed or missing anchor. Validate structure/types/filter match; never interpolate it as SQL. Reject inactive/deleted explicit score sorts.
   - No snapshot guarantee while data changes; query invalidation reloads from the first page after relevant changes.
 - **Read/update:** `GET /articles/:id`; `PATCH /articles/:id` initially `{ isRead }`, later optional `{ categoryId, expectedAssignmentRevision }`. Reading never updates FreshRSS or mail state.
 - **Progress:** POST `/pipeline/runs`; GET `/pipeline/runs/:id`; GET `/processing-tasks/:id`; POST `/processing-tasks/:id/retry`.
@@ -462,7 +482,14 @@
   - Fake provider/subprocess tests expose hidden attempts, unsafe egress and stale writes without model cost.
   - Playwright covers desktop/mobile flows and online-only behavior; physical phone/proxy/restore checks cover deployment realities.
   - Isolated live proofs and target-host measurements gate claims that fixtures cannot establish.
-- **Status:** All V checks below are proposed; none have run. Only repository/document/source/metadata inspection occurred during planning.
+- **Status:** All V checks below remain required; this amendment marks none complete. No checks or probes were rerun during this plan-only amendment.
+- **C1 isolated compatibility evidence (supplied evaluation results; not independently rerun here):**
+  - Disposable installation passed under Node `24.21.0` and npm `11.19.0` with a byte-identical copy of the unchanged npm policy. The exact C1 Pi pins and root-override versions resolved.
+  - `npm audit --omit=dev`: 0 findings. Full dev-inclusive audit still had 8 findings: 4 low and 4 moderate.
+  - Temporary project checks passed: 44 unit tests, 24 integration tests, 5 E2E tests, typecheck, lint, and build.
+  - Focused static checks and a Pi SDK fake-provider stream plus `maxRetries: 0` single-wire-request probe passed.
+  - No real provider or FreshRSS traffic occurred.
+  - **Limits:** Compatibility evidence only, not exhaustive proof, C11 completion, or a claim that all dependencies are globally secure. C11 implementation requirements, all V11 cases, V15, and production approval gates remain unchanged.
 - **Execution prerequisites:** Node baseline, lockfile installation, Docker daemon/disposable DB, browser test dependencies; C1 creates all named scripts.
   - For local DB tests: `docker compose -f compose.test.yaml up -d --wait`, then use its disposable `TEST_DATABASE_URL`. Harness refuses non-test database names.
   - Live suites require their matching `RUN_LIVE_*` flag, explicit isolated endpoints/accounts, and `ALLOW_INTEGRATION_WRITES=isolated-fixtures` for mutations. Pi calls also require operator cost/data-disclosure authorization.
@@ -567,5 +594,6 @@
 
 - **Planning scope and material product choices:** Resolved as recorded in Basis. Future provider/model credentials, exact available Codex ID, measured resource profile and real integration evidence are explicit setup/verification prerequisites, not facts already established.
 - **Ready for:** Authorized implementation of the selected delivery's code and deterministic tests, subject to package compatibility/proof gates.
+- **C1 → C11 readiness:** Dependency adoption is resolved by C1's specific user-approved exception; C11 continuation is enabled, not declared done. This amendment is plan-only and does not authorize touching externally staged source work or changing Git state.
 - **Not authorized by this plan:** Live-state changes, billable/provider calls, model/media downloads, production import acknowledgements, deployment, tracker creation, commit, merge, or push.
 - **At any missing prerequisite or material failed gate:** Stop the affected work, report evidence and the smallest decision needed, then obtain an explicit decision before a bounded rerun. Do not substitute another design automatically.

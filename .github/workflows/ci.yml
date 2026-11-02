@@ -1,0 +1,27 @@
+name: CI
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.21.0
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm run test:unit
+      # The tests create their own ephemeral loopback-only PostgreSQL containers.
+      - run: docker pull postgres:18
+      - run: npm run test:integration
+      - run: npm exec playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - run: docker build -t feedrafter:ci .
+      - run: bash tests/container/operations.sh feedrafter:ci
