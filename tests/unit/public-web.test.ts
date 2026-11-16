@@ -50,6 +50,48 @@ describe('public retrieval', () => {
     expect(result.finalUrl).toBe('https://second.example/path');
     expect(transport.mock.calls.map(([url, ip]) => [url.hostname, ip])).toEqual([['first.example', '1.1.1.1'], ['second.example', '8.8.8.8']]);
   });
+  it.each([false, true])('authorizes every redirect target before DNS and transport (allowed=%s)', async allowed => {
+    const resolver = vi.fn(resolvePublic);
+    const transport = vi.fn<TransportSeam>(async url => url.hostname === 'first.example'
+      ? response('', { location: 'https://second.example/' }, 302) : response('ok'));
+    const authorizeTarget = vi.fn(async (url: string) => {
+      if (new URL(url).hostname === 'second.example' && !allowed) throw new Error('denied');
+    });
+    const pending = createPublicWeb({ resolver, transport }).get('https://first.example/', undefined, { authorizeTarget });
+    if (allowed) expect((await pending).body.toString()).toBe('ok');
+    else await expect(pending).rejects.toThrow('denied');
+    expect(authorizeTarget.mock.calls.map(([url]) => new URL(url).hostname)).toEqual(['first.example', 'second.example']);
+    expect(resolver).toHaveBeenCalledTimes(allowed ? 2 : 1);
+    expect(transport).toHaveBeenCalledTimes(allowed ? 2 : 1);
+  });
+  it('does not bypass a denied middle redirect', async () => {
+    const resolver = vi.fn(resolvePublic);
+    const transport = vi.fn<TransportSeam>(async url => response('', { location: url.hostname === 'first.example' ? 'https://denied.example/' : 'https://last.example/' }, 302));
+    await expect(createPublicWeb({ resolver, transport }).get('https://first.example/', undefined, {
+      authorizeTarget: async url => { if (new URL(url).hostname === 'denied.example') throw new Error('denied'); },
+    })).rejects.toThrow('denied');
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(transport).toHaveBeenCalledTimes(1);
+  });
+  it.each(['cancel', 'deadline'])('stops before DNS when authorization outlives %s', async mode => {
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const resolver = vi.fn(resolvePublic);
+    const transport = vi.fn<TransportSeam>(async () => response('ok'));
+    const controller = new AbortController();
+    const pending = createPublicWeb({ resolver, transport }).get('https://first.example/', controller.signal, {
+      timeoutMs: 40, authorizeTarget: async () => { entered(); await gate; },
+    });
+    await started;
+    if (mode === 'cancel') controller.abort(new Error('cancelled'));
+    await expect(pending).rejects.toThrow(mode === 'cancel' ? 'cancelled' : 'deadline');
+    release();
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(resolver).not.toHaveBeenCalled();
+    expect(transport).not.toHaveBeenCalled();
+  });
   it.each(['http://other.example/', 'https://user:pass@other.example/', 'https://127.0.0.1/', 'https://router/'])('rejects redirect to %s', async location => {
     const transport = vi.fn<TransportSeam>(async () => response('', { location }, 302));
     await expect(createPublicWeb({ resolver: resolvePublic, transport }).get('https://public.example')).rejects.toThrow();
@@ -68,6 +110,23 @@ describe('public retrieval', () => {
     }
     const broken = Readable.from((async function* () { yield Buffer.from('partial'); throw new Error('socket closed'); })());
     await expect(createPublicWeb({ resolver: resolvePublic, transport: async () => ({ status: 200, headers: {}, body: broken }) }).get('https://public.example')).rejects.toThrow('socket closed');
+  });
+  it('supports stricter per-call limits without changing defaults', async () => {
+    const body = Buffer.alloc(101, 65);
+    for (const [data, headers] of [[body, {}], [gzipSync(body), { 'content-encoding': 'gzip' }]] as const) {
+      const web = createPublicWeb({ resolver: resolvePublic, transport: async () => response(data, headers) });
+      await expect(web.get('https://public.example', undefined, { maxBytes: 100 })).rejects.toThrow('limit');
+      expect((await web.get('https://public.example')).body).toEqual(body);
+    }
+    const web = createPublicWeb({ resolver: resolvePublic, transport: async () => response('') });
+    for (const limits of [{ maxBytes: 0 }, { maxBytes: 10 * 1024 * 1024 + 1 }, { timeoutMs: 30_001 }, { maxRedirects: -1 }]) {
+      await expect(web.get('https://public.example', undefined, limits)).rejects.toThrow('Invalid public web limits');
+    }
+    vi.useFakeTimers();
+    const stuck = createPublicWeb({ resolver: () => new Promise(() => {}), transport: async () => response('') });
+    const pending = stuck.get('https://public.example', undefined, { timeoutMs: 50 });
+    const assertion = expect(pending).rejects.toThrow('deadline');
+    await vi.advanceTimersByTimeAsync(50); await assertion;
   });
   it('propagates caller cancellation to an in-flight resolver', async () => {
     let observed: AbortSignal | undefined;

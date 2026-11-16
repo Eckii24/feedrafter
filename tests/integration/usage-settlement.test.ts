@@ -3,6 +3,7 @@ import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { migrateDatabase } from '../../src/server/adapters/postgres/migrate.js';
 import { PostgresUsageAdmissionStore } from '../../src/server/adapters/postgres/usage-admission-store.js';
+import { UsageService } from '../../src/server/application/usage.js';
 import type { ReservationIntent, TerminalUsage } from '../../src/server/domain/usage.js';
 import { createUsageDatabase } from '../helpers/usage-database.js';
 
@@ -64,6 +65,15 @@ describe('owner-fenced usage settlement', () => {
       expect(await store.settle(owner, await admitted(store, owner), usage)).toBe('settled');
       expect((await other.query('select input_tokens, output_tokens, cost_usd, tokens_source, cost_source, outcome_code from usage_ledger')).rows[0]).toEqual({ input_tokens: null, output_tokens: null, cost_usd: null, tokens_source: 'unknown', cost_source: 'unknown', outcome_code: null });
     });
+  });
+
+  it.each([[5, null], [null, 0]] as const)('persists independently observed provider counts: %s, %s', async (inputTokens, outputTokens) => {
+    const terminal = { ...usage, status: 'succeeded' as const, inputTokens, outputTokens, tokensSource: 'provider' as const };
+    const result = await new UsageService(store).executeAttempt(intent, { ...intent, signal: signal() }, async () => ({ kind: 'success', value: 'ok', terminal }));
+    expect(result.kind).toBe('completed');
+    expect((await other.query('select input_tokens, output_tokens, tokens_source, cost_usd, cost_source from usage_ledger')).rows).toEqual([
+      { input_tokens: inputTokens, output_tokens: outputTokens, tokens_source: 'provider', cost_usd: null, cost_source: 'unknown' },
+    ]);
   });
 
   it('rejects foreign token, bucket, session, and mismatched persisted identity', async () => {
@@ -155,7 +165,7 @@ describe('owner-fenced usage settlement', () => {
       const invalid: unknown[] = [
         { ...usage, status: 'reserved' }, { ...usage, inputTokens: -1 }, { ...usage, inputTokens: 1.5 },
         { ...usage, inputTokens: 2147483648 }, { ...usage, outputTokens: NaN }, { ...usage, costUsd: Infinity },
-        { ...usage, costUsd: -1 }, { ...usage, costUsd: 0 }, { ...usage, tokensSource: 'provider' }, { ...usage, tokensSource: 'provider', inputTokens: 0 }, { ...usage, costSource: 'provider' },
+        { ...usage, costUsd: -1 }, { ...usage, costUsd: 0 }, { ...usage, tokensSource: 'provider' }, { ...usage, costSource: 'provider' },
         { ...usage, tokensSource: 'catalog' }, { ...usage, outcomeCode: 'secret value\n' }, { ...usage, outcomeCode: 'x'.repeat(129) },
       ];
       for (const terminal of invalid) await expect(store.settle(owner, reservation, terminal as TerminalUsage)).rejects.toThrow();

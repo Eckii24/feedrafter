@@ -43,6 +43,34 @@
       "when": 1793618549951,
       "tag": "0005_usage_admission",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1793707053032,
+      "tag": "0006_tag_merge",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794149023950,
+      "tag": "0007_context_persistence",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794350761406,
+      "tag": "0008_summaries",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794510991277,
+      "tag": "0009_source_permissions",
+      "breakpoints": true
     }
   ]
 }

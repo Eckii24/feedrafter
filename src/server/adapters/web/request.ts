@@ -79,14 +79,14 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
   });
 }
-function counter(): Transform {
+function counter(limit: number): Transform {
   let size = 0;
   return new Transform({ transform(chunk: Buffer, _encoding, callback) {
     size += chunk.length;
-    callback(size > LIMIT ? new Error('Response body exceeds limit') : null, chunk);
+    callback(size > limit ? new Error('Response body exceeds limit') : null, chunk);
   } });
 }
-async function readBody(body: Readable, encoding: string | undefined, signal: AbortSignal): Promise<Buffer> {
+async function readBody(body: Readable, encoding: string | undefined, signal: AbortSignal, limit: number): Promise<Buffer> {
   let decoder: Transform;
   switch ((encoding ?? 'identity').trim().toLowerCase()) {
     case 'identity': decoder = new Transform({ transform(chunk, _encoding, callback) { callback(null, chunk); } }); break;
@@ -97,7 +97,7 @@ async function readBody(body: Readable, encoding: string | undefined, signal: Ab
   }
   const chunks: Buffer[] = [];
   const sink = new Writable({ write(chunk: Buffer, _encoding, callback) { chunks.push(chunk); callback(); } });
-  await pipeline(body, counter(), decoder, counter(), sink, { signal });
+  await pipeline(body, counter(limit), decoder, counter(limit), sink, { signal });
   return Buffer.concat(chunks);
 }
 
@@ -105,15 +105,21 @@ export function createPublicWeb(options: { resolver?: ResolverSeam; transport?: 
   const resolver = options.resolver ?? resolveAll;
   const transport = options.transport ?? pinnedTransport;
   return {
-    async get(input: string, callerSignal?: AbortSignal) {
+    async get(input, callerSignal, limits = {}) {
+      const { maxBytes = LIMIT, timeoutMs = DEADLINE, maxRedirects = 5 } = limits;
+      if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > LIMIT ||
+          !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > DEADLINE ||
+          !Number.isInteger(maxRedirects) || maxRedirects < 0 || maxRedirects > 5) throw new Error('Invalid public web limits');
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(new Error('Public web deadline exceeded')), DEADLINE);
+      const timer = setTimeout(() => controller.abort(new Error('Public web deadline exceeded')), timeoutMs);
       const signal = callerSignal ? AbortSignal.any([controller.signal, callerSignal]) : controller.signal;
       let unlock: (() => void) | undefined;
       try {
         let url = publicUrl(input);
         unlock = await acquire(signal);
         for (let redirects = 0; ; redirects++) {
+          if (limits.authorizeTarget) await bounded(limits.authorizeTarget(url.href, signal), signal);
+          signal.throwIfAborted();
           const addresses = await bounded(resolver(url.hostname.replace(/\.$/, ''), signal), signal);
           if (!addresses.length || !addresses.every(isPublicAddress)) throw new Error('Unsafe DNS result');
           const request = transport(url, addresses[0]!, signal);
@@ -123,13 +129,13 @@ export function createPublicWeb(options: { resolver?: ResolverSeam; transport?: 
           if (REDIRECTS.has(response.status)) {
             response.body.destroy();
             const location = response.headers.location;
-            if (!location || redirects >= 5) throw new Error('Invalid or excessive redirects');
+            if (!location || redirects >= maxRedirects) throw new Error('Invalid or excessive redirects');
             const next = publicUrl(location, url);
             if (url.protocol === 'https:' && next.protocol !== 'https:') throw new Error('HTTPS downgrade rejected');
             url = next;
             continue;
           }
-          const body = await readBody(response.body, response.headers['content-encoding'], signal);
+          const body = await readBody(response.body, response.headers['content-encoding'], signal, maxBytes);
           return { finalUrl: url.href, status: response.status, headers: response.headers, body };
         }
       } finally { clearTimeout(timer); controller.abort(); unlock?.(); }

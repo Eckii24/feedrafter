@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { UsageAccountingError, UsageAttemptError, UsageService, type InvokeResult } from '../../src/server/application/usage.js';
+import { UsageAbortError, UsageAccountingError, UsageAttemptError, UsageService, type AttemptDispatchPermit, type InvokeResult } from '../../src/server/application/usage.js';
 import type { UsageAdmissionPort, UsageOwner } from '../../src/server/ports/usage.js';
 import type { ReservationIntent, TerminalUsage } from '../../src/server/domain/usage.js';
 
@@ -26,11 +26,66 @@ describe('usage gate', () => {
     expect(order).toEqual(['recover', 'owner', 'reserve', 'invoke', 'settle', 'exit']);
   });
 
+  it('issues one permit after admission and rejects concurrent and late consumption', async () => {
+    const { port, order } = fixture();
+    let permit!: AttemptDispatchPermit;
+    await new UsageService(port).executeAttempt(intent, scope(), async (_signal, issued) => {
+      permit = issued;
+      expect(order).toEqual(['recover', 'owner', 'reserve']);
+      const attempts = await Promise.allSettled([Promise.resolve().then(() => issued.consume()), Promise.resolve().then(() => issued.consume())]);
+      expect(attempts.map((attempt) => attempt.status)).toEqual(['fulfilled', 'rejected']);
+      return { kind: 'success', value: 1, terminal: terminal('succeeded') };
+    });
+    expect(() => permit.consume()).toThrow('Dispatch permit unavailable');
+  });
+
+  it('revokes an unused permit on completion, abort and thrown callback', async () => {
+    const { port } = fixture(); const service = new UsageService(port);
+    let completed!: AttemptDispatchPermit; let completedSignal!: AbortSignal;
+    await service.executeAttempt(intent, scope(), async (signal, permit) => {
+      completed = permit; completedSignal = signal;
+      return { kind: 'success', value: 1, terminal: terminal('succeeded') };
+    });
+    expect(completedSignal.aborted).toBe(true);
+    expect(() => completed.consume()).toThrow('Dispatch permit unavailable');
+    let thrown!: AttemptDispatchPermit;
+    await expect(service.executeAttempt(intent, scope(), async (_signal, permit) => { thrown = permit; throw new Error('failure'); })).rejects.toMatchObject({ kind: 'uncertain' });
+    expect(() => thrown.consume()).toThrow('Dispatch permit unavailable');
+    const controller = new AbortController(); const started = deferred<void>(); const pendingCallback = deferred<InvokeResult<number>>();
+    let abortedPermit!: AttemptDispatchPermit;
+    const pending = service.executeAttempt(intent, { ...scope(), signal: controller.signal }, async (_signal, permit) => { abortedPermit = permit; started.resolve(); return pendingCallback.promise; });
+    await started.promise; controller.abort();
+    expect(() => abortedPermit.consume()).toThrow('Dispatch permit unavailable');
+    await expect(pending).rejects.toMatchObject({ kind: 'uncertain' });
+    pendingCallback.resolve({ kind: 'success', value: 1, terminal: terminal('succeeded') });
+  });
+
+  it('revokes the permit immediately when the owner is lost', async () => {
+    const { port, owner } = fixture(); const lost = new AbortController();
+    Object.defineProperty(owner, 'signal', { value: lost.signal });
+    const started = deferred<void>(); const callback = deferred<InvokeResult<number>>();
+    let issued!: AttemptDispatchPermit;
+    const pending = new UsageService(port).executeAttempt(intent, scope(), async (_signal, permit) => { issued = permit; started.resolve(); return callback.promise; });
+    await started.promise; lost.abort();
+    expect(() => issued.consume()).toThrow('Dispatch permit unavailable');
+    await expect(pending).rejects.toMatchObject({ phase: 'settlement' });
+    callback.resolve({ kind: 'success', value: 1, terminal: terminal('succeeded') });
+  });
+
+  it.each([[5, null], [null, 0]] as const)('passes independently reported provider counts %s, %s to settlement', async (inputTokens, outputTokens) => {
+    const { port } = fixture();
+    const observed = { ...terminal('succeeded'), inputTokens, outputTokens, tokensSource: 'provider' as const };
+    expect(await new UsageService(port).executeAttempt(intent, scope(), async () => ({ kind: 'success', value: 1, terminal: observed }))).toMatchObject({ kind: 'completed' });
+    expect(port.settle).toHaveBeenCalledWith(expect.anything(), expect.anything(), observed);
+  });
+
   it('rejects mismatched scope and pre-abort before recovery', async () => {
     const { port } = fixture(); const service = new UsageService(port); const invoke = vi.fn();
     await expect(service.executeAttempt(intent, { ...scope(), taskId: 'other' }, invoke)).rejects.toThrow(RangeError);
     const controller = new AbortController(); controller.abort('secret');
-    await expect(service.executeAttempt(intent, { ...scope(), signal: controller.signal }, invoke)).rejects.toMatchObject({ name: 'AbortError', message: 'Usage attempt aborted' });
+    const aborted = service.executeAttempt(intent, { ...scope(), signal: controller.signal }, invoke);
+    await expect(aborted).rejects.toBeInstanceOf(UsageAbortError);
+    await expect(aborted).rejects.toMatchObject({ name: 'AbortError', message: 'Usage attempt aborted' });
     expect(port.recover).not.toHaveBeenCalled(); expect(invoke).not.toHaveBeenCalled();
   });
 
@@ -43,6 +98,35 @@ describe('usage gate', () => {
     vi.mocked(port.reserve).mockRejectedValueOnce(new Error('secret db'));
     await expect(new UsageService(port).executeAttempt(intent, scope(), invoke)).rejects.toMatchObject({ phase: 'reservation', reservationId: null });
     expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('checks the auth latch at permit consumption without interrupting dispatched peers', async () => {
+    const { port } = fixture(); const service = new UsageService(port);
+    const pair = { ...intent, provider: 'permit-race-unit' };
+    const entered = deferred<void>(); const release = deferred<void>(); const peerStarted = deferred<void>(); const peerRelease = deferred<void>();
+    let wires = 0;
+    const blocked = service.executeAttempt(pair, scope(), async (_signal, permit) => {
+      entered.resolve(); await release.promise;
+      // Pi catches transport errors and resolves an error result instead of rejecting.
+      try { permit.consume(); wires++; } catch { return { kind: 'uncertain', terminal: terminal('uncertain') }; }
+      return { kind: 'success', value: 1, terminal: terminal('succeeded') };
+    });
+    const blockedResult = expect(blocked).rejects.toMatchObject({ kind: 'auth' });
+    await entered.promise;
+    const peer = service.executeAttempt(pair, scope(), async (_signal, permit) => {
+      permit.consume(); wires++; peerStarted.resolve(); await peerRelease.promise;
+      return { kind: 'success', value: 2, terminal: terminal('succeeded') };
+    });
+    await peerStarted.promise;
+    await expect(service.executeAttempt(pair, scope(), async (_signal, permit) => {
+      permit.consume(); wires++; return { kind: 'failure', failureKind: 'auth', terminal: terminal('failed') };
+    })).rejects.toMatchObject({ kind: 'auth' });
+    release.resolve(); await blockedResult;
+    expect(port.settle).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.objectContaining({ status: 'failed', outcomeCode: 'auth_paused' }));
+    const reserves = vi.mocked(port.reserve).mock.calls.length;
+    expect(await service.executeAttempt(pair, scope(), vi.fn())).toEqual({ kind: 'paused_auth' });
+    expect(port.reserve).toHaveBeenCalledTimes(reserves);
+    peerRelease.resolve(); expect(await peer).toMatchObject({ kind: 'completed', value: 2 }); expect(wires).toBe(2);
   });
 
   it('latches explicit auth across service instances and roles before settlement, not raw throws', async () => {

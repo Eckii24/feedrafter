@@ -30,6 +30,11 @@ export class PreferenceStore {
     try {
       await client.query('begin');
       if (![-1, 0, 1].includes(value) || !targets.length || new Set(targets.map(t => `${t.type}:${t.id.toLowerCase()}`)).size !== targets.length || targets.some(t => !['tag', 'source'].includes(t.type))) { await client.query('rollback'); return 'invalid'; }
+      const tagIds = targets.filter(t => t.type === 'tag').map(t => t.id.toLowerCase()).sort();
+      if (tagIds.length) {
+        const guarded = await client.query('select id from tags where id = any($1::uuid[]) order by id for share', [tagIds]);
+        if (guarded.rowCount !== tagIds.length) { await client.query('rollback'); return 'invalid'; }
+      }
       const article = await client.query<{ source_id: string | null }>('select source_id from articles where id = $1 for update', [articleId]);
       if (!article.rowCount) { await client.query('rollback'); return 'not_found'; }
       for (const target of targets) {
@@ -57,6 +62,7 @@ export class PreferenceStore {
     const client = await this.pool.connect();
     try {
       await client.query('begin');
+      if (type === 'tag') await client.query('select id from tags where id = $1 for share', [targetId]);
       const article = await client.query('select 1 from articles where id = $1 for update', [articleId]);
       if (!article.rowCount) { await client.query('rollback'); return false; }
       const table = type === 'tag' ? 'tag_votes' : 'source_votes';

@@ -10,6 +10,7 @@ async function mockApi(page: Page) {
   await page.route('**/api/v1/**', async route => {
     const url = new URL(route.request().url());
     if (url.pathname.endsWith('/events')) return route.abort();
+    if (url.pathname.endsWith('/summary')) return route.fulfill({ json: { status: 'missing' } });
     if (url.pathname.endsWith('/catalog')) return route.fulfill({ json: { category: { id, label: 'Fallback', archivedAt: null }, tags: [], assignmentRevision: 0 } });
     if (url.pathname.endsWith('/categories')) return route.fulfill({ json: { items: [{ id, label: 'Fallback', archivedAt: null }] } });
     if (url.pathname.endsWith('/tags')) return route.fulfill({ json: { items: [] } });
@@ -21,6 +22,37 @@ async function mockApi(page: Page) {
   });
   return { queries, writes };
 }
+
+test('saved summary shows current, missing and outdated states without generation controls', async ({ page }) => {
+  await mockApi(page);
+  await page.addInitScript(() => {
+    class TestEventSource {
+      onopen: (() => void) | null = null;
+      onmessage: (() => void) | null = null;
+      constructor() { window.addEventListener('summary-refresh', () => this.onmessage?.()); }
+      close() {}
+    }
+    window.EventSource = TestEventSource as unknown as typeof EventSource;
+  });
+  let status: 'current' | 'missing' | 'outdated' | 'limited' = 'current';
+  await page.route('**/api/v1/articles/*/summary', route => route.fulfill({ json: status === 'missing' ? { status } : { status, text: 'Saved summary text', contentRevision: 1, limitation: status === 'limited' ? 'Fallback source' : null, completedAt: '2026-01-02T03:04:05.000Z' } }));
+  await page.goto('/');
+  await page.getByRole('button', { name: /Untitled|img src/ }).click();
+  const summary = page.getByRole('region', { name: 'Summary' });
+  await expect(summary.getByText('Status: Current')).toBeVisible();
+  await expect(summary.getByText('Saved summary text')).toBeVisible();
+  await expect(summary.getByText(/Content revision: 1/)).toBeVisible();
+  for (const [next, expected] of [['missing', 'No saved summary.'], ['outdated', 'Status: Outdated (content has changed)'], ['limited', 'Status: Limited']] as const) {
+    status = next;
+    await page.evaluate(() => window.dispatchEvent(new Event('summary-refresh')));
+    await expect(summary.getByText(expected, { exact: true })).toBeVisible();
+  }
+  await expect(summary.getByText('Limitation: Fallback source')).toBeVisible();
+  await expect(summary.getByRole('button')).toHaveCount(0);
+  await page.evaluate(() => window.dispatchEvent(new Event('offline')));
+  await expect(summary.getByText('Summary available online only.')).toBeVisible();
+  await expect(summary.getByText('Saved summary text')).toHaveCount(0);
+});
 
 test('deleted external score recovers once after SSE invalidation and reconnect', async ({ page }) => {
   await mockApi(page);
@@ -345,6 +377,18 @@ test('failed mail selection remains visible after reload until a successful retr
   expect(attempts).toBe(2);
 });
 
+test('sent mail is displayed without a reset control', async ({ page }) => {
+  await mockApi(page);
+  let writes = 0;
+  await page.route('**/api/v1/articles/' + id + '/mail-selection', route => { writes++; return route.abort(); });
+  await page.route('**/api/v1/articles/' + id, route => route.fulfill({ json: { ...article, mailState: 'sent' } }));
+  await page.goto('/');
+  await page.getByRole('button', { name: /<img/ }).click();
+  await expect(page.getByText('Mail sent', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /mail/i })).toHaveCount(0);
+  expect(writes).toBe(0);
+});
+
 test('mobile navigation and offline writes are disabled', async ({ page, context }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   const api = await mockApi(page);
@@ -376,6 +420,31 @@ test('service worker caches only shell assets, not API responses', async ({ page
   expect(keys).toContain('/index.html');
   expect(keys.some(key => key.startsWith('/api/') || key.startsWith('/events'))).toBe(false);
   expect(keys.every(key => key === '/index.html' || key === '/icon.svg' || key === '/icon-192.png' || key === '/icon-512.png' || key === '/manifest.webmanifest' || key.startsWith('/assets/'))).toBe(true);
+  const storage = await page.evaluate(async () => ({
+    local: Object.entries(localStorage),
+    session: Object.entries(sessionStorage),
+    databases: await indexedDB.databases(),
+  }));
+  expect(storage.local).toEqual([]);
+  expect(storage.session).toEqual([]);
+  // Workbox may create its own metadata database; no application database is expected.
+  expect(storage.databases.every(database => database.name?.startsWith('workbox-'))).toBe(true);
+  const indexedValues = await page.evaluate(async names => Promise.all(names.map(name => new Promise<unknown[]>((resolve, reject) => {
+    const open = indexedDB.open(name);
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result;
+      const stores = Array.from(db.objectStoreNames);
+      if (!stores.length) { db.close(); resolve([]); return; }
+      const tx = db.transaction(stores, 'readonly');
+      const values: unknown[] = [];
+      for (const store of stores) { const request = tx.objectStore(store).getAll(); request.onsuccess = () => values.push(...request.result); }
+      tx.oncomplete = () => { db.close(); resolve(values); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  }))), storage.databases.map(database => database.name!));
+  expect(JSON.stringify(indexedValues)).not.toContain(article.title);
+  expect(JSON.stringify(indexedValues)).not.toContain(id);
   await page.unroute('**/api/v1/**');
   await context.setOffline(true);
   await page.reload();

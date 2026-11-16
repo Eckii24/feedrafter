@@ -1,8 +1,9 @@
 import { isIP } from 'node:net';
 import { readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
+import { KarakeepClient } from './adapters/karakeep/client.js';
 
-export interface AppConfig { databaseUrl: string; origin: string; host: string; port: number; trustedProxies: string[]; fresh?: { baseUrl: string; email: string; password: string } }
+export interface AppConfig { databaseUrl: string; origin: string; host: string; port: number; trustedProxies: string[]; fresh?: { baseUrl: string; email: string; password: string }; karakeep?: { baseUrl: string; token: string } }
 function value(env: NodeJS.ProcessEnv, name: string, fallback?: string): string {
   const v = env[name] ?? fallback;
   if (v === undefined || !v.trim() || v !== v.trim()) throw new Error(`Invalid ${name}`);
@@ -39,5 +40,18 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     } else password = value(env, 'FRESHRSS_API_PASSWORD');
     fresh = { baseUrl, email: value(env, 'FRESHRSS_EMAIL'), password };
   } else if (['FRESHRSS_BASE_URL', 'FRESHRSS_EMAIL', 'FRESHRSS_API_PASSWORD', 'FRESHRSS_API_PASSWORD_FILE'].some(k => env[k] !== undefined && !env[k]?.trim())) throw new Error('Invalid FreshRSS configuration');
-  return { databaseUrl, origin: originUrl.origin, host, port: Number(portText), trustedProxies, ...(fresh ? { fresh } : {}) };
+  let karakeep: AppConfig['karakeep'];
+  if (env.KARAKEEP_ENABLED !== undefined && !['true', 'false'].includes(env.KARAKEEP_ENABLED)) throw new Error('Invalid KARAKEEP_ENABLED');
+  if (env.KARAKEEP_ENABLED === 'true') {
+    if (env.KARAKEEP_TOKEN !== undefined && env.KARAKEEP_TOKEN_FILE !== undefined) throw new Error('Invalid Karakeep secret configuration');
+    let token: string;
+    if (env.KARAKEEP_TOKEN_FILE !== undefined) {
+      const path = value(env, 'KARAKEEP_TOKEN_FILE');
+      if (!isAbsolute(path) || !statSync(path).isFile() || statSync(path).size > 16384) throw new Error('Invalid Karakeep secret file');
+      token = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
+    } else token = value(env, 'KARAKEEP_TOKEN');
+    karakeep = { baseUrl: value(env, 'KARAKEEP_BASE_URL'), token };
+    new KarakeepClient(karakeep); // Validate exactly the authority and bearer syntax used by the client.
+  }
+  return { databaseUrl, origin: originUrl.origin, host, port: Number(portText), trustedProxies, ...(fresh ? { fresh } : {}), ...(karakeep ? { karakeep } : {}) };
 }

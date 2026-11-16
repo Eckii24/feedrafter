@@ -1,9 +1,12 @@
 import { createServer } from 'node:http';
+import { Readable } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import { extractHtml } from '../../src/server/adapters/web/extract.js';
+import { createPublicWeb, type TransportSeam } from '../../src/server/adapters/web/request.js';
 import { prepareArticle, type ArticleQualityClassifier, type ArticleExtractionFallback } from '../../src/server/application/prepare-article.js';
 import type { ContentExecutionContext, ContentStore } from '../../src/server/adapters/postgres/content-store.js';
 import type { PublicWeb } from '../../src/server/ports/public-web.js';
+import type { SourceFallbackPermission } from '../../src/server/ports/source-fallback-permission.js';
 
 const context: ContentExecutionContext = { articleId: 'article', taskId: 'task', action: 'prepare', generation: 1, executionToken: 'token', expectedContentRevision: 4 };
 const paragraph = 'A thoughtful report with independent details and meaningful factual information. '.repeat(30);
@@ -23,8 +26,12 @@ function fixture(body = html(paragraph)) {
   const web: PublicWeb = { async get() { return { status: 200, finalUrl: 'https://example.com/article', headers: { 'content-type': 'text/html; charset=utf-8' }, body: Buffer.from(body) }; } };
   const classifier: ArticleQualityClassifier = { classify: vi.fn(async () => usable) };
   const fallback: ArticleExtractionFallback = { extract: vi.fn(async () => ({ text: paragraph, sourceUrl: 'https://example.com/article' })) };
-  const run = (options: { allowFallback?: boolean; signal?: AbortSignal } = {}) => prepareArticle({ web, content: store, classifier, fallback, now: () => new Date('2026-01-01Z') }, { context, originalUrl: 'https://example.com/article', ...options });
-  return { run, web, classifier, fallback, publications, content: () => content, stale: () => { current = false; } };
+  const permission = { resolveForArticle: vi.fn<SourceFallbackPermission['resolveForArticle']>(async () => false), resolveHost: vi.fn<SourceFallbackPermission['resolveHost']>(async host => host === 'other.com') };
+  const run = ({ permission: decision = false, noResolver = false, noFallback = false, ...options }: { permission?: boolean | null; noResolver?: boolean; noFallback?: boolean; signal?: AbortSignal } = {}) => {
+    permission.resolveForArticle.mockResolvedValue(decision);
+    return prepareArticle({ web, content: store, classifier, ...(!noFallback && { fallback }), ...(!noResolver && { permission }), now: () => new Date('2026-01-01Z') }, { context, originalUrl: 'https://example.com/article', ...options });
+  };
+  return { run, web, classifier, fallback, permission, publications, content: () => content, stale: () => { current = false; } };
 }
 
 describe('article preparation', () => {
@@ -34,6 +41,7 @@ describe('article preparation', () => {
     expect(f.content()).toContain('thoughtful report');
     expect(f.publications[0]).toMatchObject({ kind: 'success', content: { quality: 'usable', sourceUrl: 'https://example.com/article', limitation: 'quality is heuristic' } });
     expect(f.fallback.extract).not.toHaveBeenCalled();
+    expect(f.permission.resolveForArticle).not.toHaveBeenCalled();
   });
   it.each([['short', html('short')], ['navigation', '<html><body><nav><a href="/">Home</a><a href="/news">News</a></nav></body></html>'], ['malformed', '<html><body><p><']])('rejects %s without replacing previous content', async (_label, body) => {
     const f = fixture(body);
@@ -46,31 +54,66 @@ describe('article preparation', () => {
     const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: score, usable: true });
     expect((await f.run()).status).toBe('failed'); expect(f.content()).toBe('previous');
   });
-  it('denies fallback by default; permits it explicitly and reclassifies independently', async () => {
+  it('denies fallback by default; permits it with source permission and reclassifies independently', async () => {
     const f = fixture();
     vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.5, usable: false }).mockResolvedValueOnce({ probability: 0.5, usable: false }).mockResolvedValueOnce(usable);
     expect((await f.run()).status).toBe('failed');
     expect(f.fallback.extract).not.toHaveBeenCalled();
-    expect((await f.run({ allowFallback: true })).status).toBe('succeeded');
+    expect((await f.run({ permission: true })).status).toBe('succeeded');
+    expect(f.permission.resolveForArticle).toHaveBeenCalledWith(context.articleId, 'example.com');
     expect(f.classifier.classify).toHaveBeenCalledTimes(3);
     expect(f.publications[1]).toMatchObject({ kind: 'success', content: { limitation: 'fallback; quality is heuristic' } });
   });
+  it.each([false, null])('denies fallback for permission %s', async decision => {
+    const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: 0.2, usable: false });
+    expect((await f.run({ permission: decision })).status).toBe('failed');
+    expect(f.publications[0]).toMatchObject({ kind: 'failure', errorCode: 'fallback_permission_denied' });
+    expect(f.fallback.extract).not.toHaveBeenCalled();
+  });
+  it('fails closed without resolver, including a legacy arbitrary allowFallback flag', async () => {
+    const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: 0.2, usable: false });
+    const legacy = { noResolver: true, allowFallback: true };
+    expect((await f.run(legacy)).status).toBe('failed');
+    expect(f.publications[0]).toMatchObject({ kind: 'failure', errorCode: 'fallback_permission_denied' });
+    expect(f.fallback.extract).not.toHaveBeenCalled();
+  });
+  it('does not resolve permission when fallback is absent', async () => {
+    const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: 0.2, usable: false });
+    expect((await f.run({ permission: true, noFallback: true })).status).toBe('failed');
+    expect(f.permission.resolveForArticle).not.toHaveBeenCalled();
+    expect(f.fallback.extract).not.toHaveBeenCalled();
+  });
+  it('uses the original hostname, not a redirect, for permission', async () => {
+    const f = fixture();
+    f.web.get = async () => ({ status: 200, finalUrl: 'https://redirect.example/page', headers: { 'content-type': 'text/html' }, body: Buffer.from(html(paragraph)) });
+    vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.2, usable: false }).mockResolvedValueOnce(usable);
+    expect((await f.run({ permission: true })).status).toBe('succeeded');
+    expect(f.permission.resolveForArticle).toHaveBeenCalledWith(context.articleId, 'example.com');
+  });
+  it('sanitizes resolver errors and never invokes fallback', async () => {
+    const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: 0.2, usable: false });
+    f.permission.resolveForArticle.mockRejectedValueOnce(new Error('secret https://example.com/token'));
+    expect((await f.run()).status).toBe('failed');
+    expect(f.publications[0]).toMatchObject({ kind: 'failure', errorCode: 'preparation_failed' });
+    expect(JSON.stringify(f.publications)).not.toContain('secret');
+    expect(f.fallback.extract).not.toHaveBeenCalled();
+  });
   it('rejects fallback when independent classification fails', async () => {
     const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: 0.1, usable: false });
-    expect((await f.run({ allowFallback: true })).status).toBe('failed'); expect(f.content()).toBe('previous');
+    expect((await f.run({ permission: true })).status).toBe('failed'); expect(f.content()).toBe('previous');
   });
   it.each([null, {}, { probability: NaN, usable: true }, { probability: 1.1, usable: true }, { probability: 1, usable: true, extra: true }])('rejects invalid classifier output', async value => {
     const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue(value);
-    expect((await f.run({ allowFallback: true })).status).toBe('failed'); expect(f.content()).toBe('previous'); expect(f.fallback.extract).not.toHaveBeenCalled();
+    expect((await f.run({ permission: true })).status).toBe('failed'); expect(f.content()).toBe('previous'); expect(f.fallback.extract).not.toHaveBeenCalled();
   });
   it.each([null, { text: '', sourceUrl: 'https://example.com' }, { text: 'text', sourceUrl: 'http://127.0.0.1/' }, { text: paragraph, sourceUrl: 'https://example.com', complete: true }])('rejects invalid fallback output', async value => {
     const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValue({ probability: 0.1, usable: false }); vi.mocked(f.fallback.extract).mockResolvedValue(value);
-    expect((await f.run({ allowFallback: true })).status).toBe('failed'); expect(f.content()).toBe('previous');
+    expect((await f.run({ permission: true })).status).toBe('failed'); expect(f.content()).toBe('previous');
   });
   it('requires fallback provenance to be fetched through the capability', async () => {
     const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.2, usable: false });
     vi.mocked(f.fallback.extract).mockResolvedValue({ text: paragraph, sourceUrl: 'https://other.com/article' });
-    expect((await f.run({ allowFallback: true })).status).toBe('failed'); expect(f.content()).toBe('previous');
+    expect((await f.run({ permission: true })).status).toBe('failed'); expect(f.content()).toBe('previous');
   });
   it('allows fetched fallback provenance', async () => {
     const f = fixture(); vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.2, usable: false }).mockResolvedValueOnce(usable);
@@ -78,7 +121,49 @@ describe('article preparation', () => {
       await webFetch('https://other.com/article');
       return { text: paragraph, sourceUrl: 'https://other.com/article' };
     });
-    expect((await f.run({ allowFallback: true })).status).toBe('succeeded');
+    expect((await f.run({ permission: true })).status).toBe('succeeded');
+  });
+  it.each([
+    ['denied.example', false, false], ['absent.example', false, false], ['sub.example.com', false, false],
+    ['allowed.example', true, true], ['BÜCHER.Example.', true, true], ['EXAMPLE.COM.', false, true],
+  ])('applies target-specific permission to %s', async (host, hostRule, succeeds) => {
+    const f = fixture();
+    f.permission.resolveHost.mockImplementation(async target => target === 'allowed.example' || (target === 'xn--bcher-kva.example' && hostRule));
+    vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.2, usable: false }).mockResolvedValue(usable);
+    const transport = vi.fn<TransportSeam>(async () => ({ status: 200, headers: { 'content-type': 'text/html' }, body: Readable.from([html(paragraph)]) }));
+    f.web.get = createPublicWeb({ resolver: async () => ['8.8.8.8'], transport }).get;
+    vi.mocked(f.fallback.extract).mockImplementation(async ({ webFetch }) => {
+      await webFetch(`https://${host}/linked`).catch(() => {});
+      return { text: paragraph, sourceUrl: 'https://example.com/article' };
+    });
+    expect((await f.run({ permission: true })).status).toBe(succeeds ? 'succeeded' : 'failed');
+    expect(transport).toHaveBeenCalledTimes(succeeds ? 2 : 1);
+    if (!succeeds) expect(f.publications[0]).toMatchObject({ errorCode: 'fallback_permission_denied' });
+  });
+  it('does not grant fallback provenance to a different-host primary redirect', async () => {
+    const f = fixture();
+    f.web.get = async () => ({ status: 200, finalUrl: 'https://denied.example/page', headers: { 'content-type': 'text/html' }, body: Buffer.from(html(paragraph)) });
+    vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.2, usable: false }).mockResolvedValue(usable);
+    vi.mocked(f.fallback.extract).mockResolvedValue({ text: paragraph, sourceUrl: 'https://denied.example/page' });
+    expect((await f.run({ permission: true })).status).toBe('failed');
+    expect(f.publications[0]).toMatchObject({ errorCode: 'fallback_permission_denied' });
+  });
+  it('rejects a swallowed denied redirect during fallback before dispatch', async () => {
+    const f = fixture();
+    vi.mocked(f.classifier.classify).mockResolvedValueOnce({ probability: 0.2, usable: false }).mockResolvedValue(usable);
+    const resolver = vi.fn(async () => ['8.8.8.8']);
+    const transport = vi.fn<TransportSeam>(async url => url.pathname === '/linked'
+      ? { status: 302, headers: { location: 'https://denied.example/next' }, body: Readable.from([]) }
+      : { status: 200, headers: { 'content-type': 'text/html' }, body: Readable.from([html(paragraph)]) });
+    f.web.get = createPublicWeb({ resolver, transport }).get;
+    vi.mocked(f.fallback.extract).mockImplementation(async ({ webFetch }) => {
+      await webFetch('https://other.com/linked').catch(() => {});
+      return { text: paragraph, sourceUrl: 'https://example.com/article' };
+    });
+    expect((await f.run({ permission: true })).status).toBe('failed');
+    expect(f.publications[0]).toMatchObject({ errorCode: 'fallback_permission_denied' });
+    expect(transport.mock.calls.map(([url]) => url.hostname)).toEqual(['example.com', 'other.com']);
+    expect(resolver).toHaveBeenCalledTimes(2);
   });
   it.each(['paywall', '401', '402', '403', 'failed', 'limit', 'pending', 'non-html', 'encoding'])('denies fallback after %s even if adapter hides it', async scenario => {
     const f = fixture();
@@ -96,7 +181,7 @@ describe('article preparation', () => {
       else await webFetch('https://other.com/page').catch(() => {});
       return { text: paragraph, sourceUrl: 'https://example.com/article' };
     });
-    expect(await f.run({ allowFallback: true })).toEqual({ status: 'failed', revision: 4 });
+    expect(await f.run({ permission: true })).toEqual({ status: 'failed', revision: 4 });
     expect(f.publications[0]).toMatchObject({ kind: 'failure' });
     if (['paywall', '401', '402', '403', 'pending'].includes(scenario)) expect(f.publications[0]).toMatchObject({ errorCode: 'access_denied' });
     expect(f.content()).toBe('previous');
@@ -112,7 +197,7 @@ describe('article preparation', () => {
       void webFetch('https://other.com/page').catch(() => {});
       return { text: paragraph, sourceUrl: 'https://example.com/article' };
     });
-    const pending = f.run({ allowFallback: true });
+    const pending = f.run({ permission: true });
     await vi.waitFor(() => expect(f.fallback.extract).toHaveBeenCalled());
     expect(f.publications).toHaveLength(0);
     release();
@@ -148,7 +233,7 @@ describe('article preparation', () => {
   });
   it('access evidence overrides long text and never invokes fallback', async () => {
     const f = fixture(html(paragraph + ' Subscribe to continue reading.'));
-    expect((await f.run({ allowFallback: true })).status).toBe('failed');
+    expect((await f.run({ permission: true })).status).toBe('failed');
     expect(f.publications[0]).toMatchObject({ kind: 'failure', errorCode: 'access_denied' }); expect(f.content()).toBe('previous');
     expect(f.classifier.classify).not.toHaveBeenCalled(); expect(f.fallback.extract).not.toHaveBeenCalled();
   });

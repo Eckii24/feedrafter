@@ -43,7 +43,7 @@ export function ScoreSettings({ online, categories }: { online: boolean; categor
   }
   return <section aria-labelledby="scores-heading">
     <h2 id="scores-heading">Score definitions</h2>
-    <p>Model execution and reevaluation are not available. The fallback category uses the global prompt.</p>
+    <p>Explicit reevaluation is available in article detail; model execution remains unavailable without authorized configuration. The fallback category uses the global prompt.</p>
     {error && <p role="alert">{error}</p>}{status && <p role="status">{status}</p>}
     <ScoreForm key="new" initial={empty} title="New score" disabled={!online || busy} save={body => save(null, body)} register={(action, node) => { if (node) controls.current.set(action, node); else controls.current.delete(action); }} />
     {items.map(item => item.deletedAt ? <p key={item.id}>{item.name} (deleted)</p> : <div key={item.id}>

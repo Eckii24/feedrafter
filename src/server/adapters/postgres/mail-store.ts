@@ -65,15 +65,16 @@ export class MailStore {
     const result = await this.pool.query(`select a.id, a.url, a.title, a.source_id as "sourceId", s.title as "sourceTitle", a.author,
       a.published_at as "publishedAt", a.imported_at as "importedAt", a.kind,
       to_char(a.mail_selected_at at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "selectedAt",
-      c.text as "contentText", c.quality as "contentQuality", c.limitation as "contentLimitation", c.failure_code as "contentFailureCode", c.source_url as "contentSourceUrl", c.captured_at as "contentCapturedAt"
-      from articles a left join sources s on s.id = a.source_id left join article_contents c on c.article_id = a.id
+      c.text as "contentText", c.quality as "contentQuality", c.limitation as "contentLimitation", c.failure_code as "contentFailureCode", c.source_url as "contentSourceUrl", c.captured_at as "contentCapturedAt",
+      sm.text as "summaryText", sm.limitation as "summaryLimitation", sm.content_revision as "summaryRevision", a.content_revision as "contentRevision"
+      from articles a left join sources s on s.id = a.source_id left join article_contents c on c.article_id = a.id left join article_summaries sm on sm.article_id = a.id
       where a.mail_state = 'selected' and ($1::timestamptz is null or (a.mail_selected_at, a.id) > ($1::timestamptz, $2::uuid))
       order by a.mail_selected_at, a.id limit $3`, [anchor?.selectedAt ?? null, anchor?.id ?? null, limit + 1]);
     const rows = result.rows; const page = rows.slice(0, limit); const last = page.at(-1);
     return {
       items: page.map(row => ({ id: row.id, url: row.url, title: row.title, sourceId: row.sourceId, sourceTitle: row.sourceTitle, author: row.author, publishedAt: row.publishedAt, importedAt: row.importedAt, kind: row.kind, selectedAt: row.selectedAt,
         content: { status: row.contentText === null ? 'missing' : row.contentLimitation || row.contentFailureCode || row.contentQuality !== 'usable' ? 'limited' : 'available', text: row.contentText, quality: row.contentQuality, limitation: row.contentLimitation, failureCode: row.contentFailureCode, sourceUrl: row.contentSourceUrl, capturedAt: row.contentCapturedAt },
-        transcript: { status: 'missing', text: null }, summary: { status: 'missing', text: null } })),
+        transcript: { status: 'missing', text: null }, summary: row.summaryText === null ? { status: 'missing', text: null } : { status: row.summaryLimitation || row.summaryRevision !== row.contentRevision ? 'limited' : 'available', text: row.summaryText } })),
       nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ v: 1, selectedAt: last.selectedAt, id: last.id })).toString('base64url') : null,
     };
   }

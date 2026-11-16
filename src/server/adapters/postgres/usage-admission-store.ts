@@ -14,7 +14,7 @@ function validateTerminal(value: TerminalUsage): void {
     || !tokens(value.inputTokens) || !tokens(value.outputTokens)
     || !(value.costUsd === null || (typeof value.costUsd === 'number' && Number.isFinite(value.costUsd) && value.costUsd >= 0))
     || !['provider', 'unknown'].includes(value.tokensSource) || !['provider', 'unknown'].includes(value.costSource)
-    || (value.tokensSource === 'provider' && (value.inputTokens === null || value.outputTokens === null))
+    || (value.tokensSource === 'provider' && value.inputTokens === null && value.outputTokens === null)
     || (value.costSource === 'provider' && value.costUsd === null)
     || (value.costSource === 'unknown' && value.costUsd !== null)
     || !(value.outcomeCode === null || (typeof value.outcomeCode === 'string' && /^[a-z0-9_]{1,128}$/.test(value.outcomeCode)))) {

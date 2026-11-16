@@ -2,4 +2,5 @@
 
 .article-catalog form,.article-catalog label,.article-catalog li{min-width:0;max-width:100%}.article-catalog select,.article-catalog button{min-width:0;max-width:100%}
 
+.top{flex-wrap:wrap}
 .catalog-settings{overflow-wrap:anywhere}.catalog-settings ul{padding-left:1.5rem}.catalog-settings li,.catalog-settings form,.catalog-settings label{min-width:0;max-width:100%}.catalog-settings input,.catalog-settings button{max-width:100%}.catalog-settings input{min-width:0}

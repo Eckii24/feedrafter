@@ -14,6 +14,9 @@ export type ContextInput = Readonly<{
   tools: string;
   limits: Readonly<{ contextTokens: number; outputTokens: number; framingTokens: number; maxInputTokens?: number }>;
   tokenizer?: (serializedRequest: string) => number;
+  // Evidence execution needs a persisted chunk even if the generator fits all content.
+  forceChunks?: boolean;
+  scoreTargetId?: string;
 }>;
 
 type Selected = { title?: string | null; content?: string; category?: string | null; tagWeights?: { tag: string; weight: number }[]; sourceWeight?: number | null };
@@ -28,6 +31,17 @@ export type ContextPlan = {
 const integer = (value: number, min: number) => Number.isSafeInteger(value) && value >= min;
 const isBoundary = (s: string, i: number) => i <= 0 || i >= s.length || !(s.charCodeAt(i - 1) >= 0xd800 && s.charCodeAt(i - 1) <= 0xdbff && s.charCodeAt(i) >= 0xdc00 && s.charCodeAt(i) <= 0xdfff);
 
+/** Canonical property order for selected context, including the optional content last. */
+export function selectContext(article: ContextInput['article'], fields: ContextFields): Selected {
+  const selected: Selected = {};
+  if (fields.includeTitle) selected.title = article.title;
+  if (fields.includeCategory) selected.category = article.category;
+  if (fields.includeTagWeights) selected.tagWeights = article.tagWeights.map(t => ({ tag: t.tag, weight: t.weight }));
+  if (fields.includeSourceWeight) selected.sourceWeight = article.sourceWeight;
+  if (fields.includeContent) selected.content = article.content;
+  return selected;
+}
+
 /** Plans only the serialized envelope returned here. Callers must reserve additional provider framing tokens and send this exact envelope. UTF-8 bytes are a conservative estimate only for tokenizers with at most one token per byte. */
 export function prepareContext(input: ContextInput): ContextPlan {
   if (!input || !input.article || !input.fields || !input.limits || typeof input.taskKind !== 'string' || !input.taskKind.trim() || typeof input.article.id !== 'string' || !input.article.id.trim() || !integer(input.article.contentRevision, 0) || !integer(input.generation, 0)) throw new RangeError('invalid context identity');
@@ -38,11 +52,7 @@ export function prepareContext(input: ContextInput): ContextPlan {
   if (typeof article.content !== 'string' || (article.title !== null && typeof article.title !== 'string') || (article.category !== null && typeof article.category !== 'string') || (article.sourceWeight !== null && !Number.isFinite(article.sourceWeight)) || !Array.isArray(article.tagWeights) || article.tagWeights.some(t => !t || typeof t.tag !== 'string' || !Number.isFinite(t.weight))) throw new RangeError('invalid article');
   const times = article.timeBoundaries ?? [];
   if (!Array.isArray(times) || times.some((t, i) => !t || !integer(t.offset, 0) || t.offset > article.content.length || !isBoundary(article.content, t.offset) || !Number.isFinite(t.seconds) || t.seconds < 0 || (i > 0 && (t.offset <= times[i - 1]!.offset || t.seconds < times[i - 1]!.seconds)))) throw new RangeError('invalid time boundaries');
-  const selected: Selected = {};
-  if (fields.includeTitle) selected.title = article.title;
-  if (fields.includeCategory) selected.category = article.category;
-  if (fields.includeTagWeights) selected.tagWeights = article.tagWeights.map(t => ({ tag: t.tag, weight: t.weight }));
-  if (fields.includeSourceWeight) selected.sourceWeight = article.sourceWeight;
+  const selected = selectContext(article, { ...fields, includeContent: false });
   const size = (content?: string): SizedRequest => {
     const context: Selected = { ...selected };
     if (content !== undefined) context.content = content;
@@ -61,7 +71,8 @@ export function prepareContext(input: ContextInput): ContextPlan {
   const fixed = size(fields.includeContent ? '' : undefined);
   if (!fits(fixed)) throw new RangeError('fixed request envelope exceeds limits');
   const direct = length ? size(article.content) : fixed;
-  if (fits(direct)) return { kind: 'direct', direct, basis, coverage: { selected: fields.includeContent, length, intervals: length ? [{ start: 0, end: length }] : [], missing: [], complete: true } };
+  if (fits(direct) && !input.forceChunks) return { kind: 'direct', direct, basis, coverage: { selected: fields.includeContent, length, intervals: length ? [{ start: 0, end: length }] : [], missing: [], complete: true } };
+  if (!length) throw new RangeError('chunk evidence requires selected content');
 
   // Bound all provider prefix probes across the plan, including binary and preferred-boundary
   // searches. JSON escaping uses at most six UTF-8 bytes per UTF-16 content unit.

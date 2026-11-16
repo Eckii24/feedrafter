@@ -3,6 +3,8 @@ import type { ModelUsageBucket, ReservationIntent, TerminalUsage } from '../doma
 import type { UsageAdmissionPort } from '../ports/usage.js';
 
 export type AttemptScope = { bucket: ModelUsageBucket; taskId?: string; turnId?: string; signal: AbortSignal };
+/** A transport must consume this synchronously immediately before its one transmission. */
+export type AttemptDispatchPermit = { consume(): void };
 export type InvokeResult<T> =
   | { kind: 'success'; value: T; terminal: TerminalUsage & { status: 'succeeded' } }
   | { kind: 'failure'; failureKind: 'auth' | 'provider'; terminal: TerminalUsage & { status: 'failed' } }
@@ -32,7 +34,8 @@ function pause(intent: ReservationIntent): void {
 const safeTerminal = (status: 'failed' | 'uncertain', outcomeCode: string): TerminalUsage => ({
   status, outcomeCode, inputTokens: null, outputTokens: null, costUsd: null, tokensSource: 'unknown', costSource: 'unknown',
 });
-class UsageAbortError extends Error { constructor() { super('Usage attempt aborted'); this.name = 'AbortError'; } }
+/** When thrown by UsageService, no reservation was admitted and invocation did not start. */
+export class UsageAbortError extends Error { constructor() { super('Usage attempt aborted'); this.name = 'AbortError'; } }
 function aborted(): Error { return new UsageAbortError(); }
 function trustworthyTerminal(value: TerminalUsage | undefined): value is TerminalUsage {
   const tokens = (n: unknown) => n === null || (typeof n === 'number' && Number.isInteger(n) && n >= 0 && n <= 2147483647);
@@ -40,7 +43,7 @@ function trustworthyTerminal(value: TerminalUsage | undefined): value is Termina
     && (value.costUsd === null || (typeof value.costUsd === 'number' && Number.isFinite(value.costUsd) && value.costUsd >= 0))
     && (value.tokensSource === 'provider' || value.tokensSource === 'unknown')
     && (value.costSource === 'provider' || value.costSource === 'unknown')
-    && (value.tokensSource !== 'provider' || (value.inputTokens !== null && value.outputTokens !== null))
+    && (value.tokensSource !== 'provider' || value.inputTokens !== null || value.outputTokens !== null)
     && (value.costSource !== 'provider' || value.costUsd !== null)
     && (value.costSource !== 'unknown' || value.costUsd === null)
     && (value.outcomeCode === null || (typeof value.outcomeCode === 'string' && /^[a-z0-9_]{1,128}$/.test(value.outcomeCode)));
@@ -56,7 +59,7 @@ function validate(intent: ReservationIntent, scope: AttemptScope): void {
 
 export class UsageService {
   constructor(private readonly port: UsageAdmissionPort) {}
-  async executeAttempt<T>(input: ReservationIntent, scope: AttemptScope, invoke: (signal: AbortSignal) => Promise<InvokeResult<T>>): Promise<AttemptResult<T>> {
+  async executeAttempt<T>(input: ReservationIntent, scope: AttemptScope, invoke: (signal: AbortSignal, permit: AttemptDispatchPermit) => Promise<InvokeResult<T>>): Promise<AttemptResult<T>> {
     validate(input, scope);
     const intent = { ...input };
     const signal = scope.signal;
@@ -91,25 +94,39 @@ export class UsageService {
           failure = signal.aborted ? 'aborted' : 'auth';
           terminal = safeTerminal('failed', signal.aborted ? 'cancelled_before_dispatch' : 'auth_paused');
         } else {
-          const combined = AbortSignal.any([signal, owner.signal]);
+          const lifetime = new AbortController();
+          const combined = AbortSignal.any([signal, owner.signal, lifetime.signal]);
+          let permitOpen = true;
+          let permitConsumed = false;
+          let authRefusedBeforeConsume = false;
+          const authBlocked = new Error('Dispatch paused for authentication');
+          const permit: AttemptDispatchPermit = Object.freeze({ consume() {
+            if (!permitOpen || permitConsumed || combined.aborted) throw new Error('Dispatch permit unavailable');
+            if (isPaused(intent)) { authRefusedBeforeConsume = true; throw authBlocked; }
+            permitConsumed = true;
+          } });
           // Listen before invoking. Both callback handlers stay attached after abort.
-          const winner = await new Promise<{ kind: 'callback'; value: InvokeResult<T> } | { kind: 'thrown' | 'abort' }>((resolve) => {
-            const onAbort = () => { combined.removeEventListener('abort', onAbort); resolve({ kind: 'abort' }); };
+          const winner = await new Promise<{ kind: 'callback'; value: InvokeResult<T> } | { kind: 'thrown' | 'abort' | 'auth_blocked' }>((resolve) => {
+            const onAbort = () => { permitOpen = false; combined.removeEventListener('abort', onAbort); resolve({ kind: 'abort' }); };
+            const finish = () => { permitOpen = false; combined.removeEventListener('abort', onAbort); lifetime.abort(); };
             combined.addEventListener('abort', onAbort, { once: true });
             if (combined.aborted) { onAbort(); return; }
             try {
-              void Promise.resolve(invoke(combined)).then(
+              void Promise.resolve(invoke(combined, permit)).then(
                 (value) => {
+                  finish();
                   // Observe explicit auth even after abort, independently of terminal metadata.
                   if (value?.kind === 'failure' && value.failureKind === 'auth') pause(intent);
-                  combined.removeEventListener('abort', onAbort); resolve({ kind: 'callback', value });
+                  resolve({ kind: 'callback', value });
                 },
-                () => { combined.removeEventListener('abort', onAbort); resolve({ kind: 'thrown' }); },
+                (error: unknown) => { finish(); resolve({ kind: error === authBlocked ? 'auth_blocked' : 'thrown' }); },
               );
-            } catch { combined.removeEventListener('abort', onAbort); resolve({ kind: 'thrown' }); }
+            } catch (error) { finish(); resolve({ kind: error === authBlocked ? 'auth_blocked' : 'thrown' }); }
           });
           if (owner.signal.aborted) throw new UsageAccountingError('settlement', reservationId);
-          if (winner.kind === 'callback' && winner.value && trustworthyTerminal(winner.value.terminal) && (
+          if (authRefusedBeforeConsume || winner.kind === 'auth_blocked') {
+            failure = 'auth'; terminal = safeTerminal('failed', 'auth_paused');
+          } else if (winner.kind === 'callback' && winner.value && trustworthyTerminal(winner.value.terminal) && (
             (winner.value.kind === 'success' && winner.value.terminal?.status === 'succeeded')
             || (winner.value.kind === 'failure' && winner.value.terminal?.status === 'failed' && ['auth', 'provider'].includes(winner.value.failureKind))
             || (winner.value.kind === 'uncertain' && winner.value.terminal?.status === 'uncertain')

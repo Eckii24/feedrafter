@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, foreignKey, index, integer, pgTable, text, timestamp, unique, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, doublePrecision, foreignKey, index, integer, pgTable, text, timestamp, unique, uuid } from "drizzle-orm/pg-core";
 import { categories } from "./enrichment.js";
 
 const time = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
@@ -15,7 +15,10 @@ export const sources = pgTable("sources", {
   contextId: uuid("context_id").notNull().references(() => importContexts.id),
   externalFeedId: text("external_feed_id").notNull(),
   title: text(),
+  manualOffset: doublePrecision("manual_offset").notNull().default(0),
+  permissionOverride: boolean("permission_override"),
 }, (t) => [
+  check("source_offset_finite", sql`${t.manualOffset} > '-Infinity'::float8 and ${t.manualOffset} < 'Infinity'::float8`),
   unique().on(t.contextId, t.externalFeedId),
   unique().on(t.contextId, t.id),
   check("source_external_id_nonempty", sql`length(${t.externalFeedId}) > 0`),
@@ -76,7 +79,9 @@ export const appSettings = pgTable("app_settings", {
   importEnabled: boolean("import_enabled").notNull().default(true),
   importIntervalSeconds: integer("import_interval_seconds").notNull().default(14400),
   nextImportAt: time("next_import_at"),
+  preferenceHalfLifeDays: doublePrecision("preference_half_life_days").notNull().default(90),
 }, (t) => [
+  check("settings_preference_half_life", sql`${t.preferenceHalfLifeDays} > 0 and ${t.preferenceHalfLifeDays} < 'Infinity'::float8`),
   check("settings_singleton", sql`${t.id} = 1`),
   check("settings_interval", sql`${t.importIntervalSeconds} > 0`),
 ]);

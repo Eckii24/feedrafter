@@ -7,8 +7,12 @@ import { createDatabase } from "../../src/server/adapters/postgres/client.js";
 import { migrateDatabase } from "../../src/server/adapters/postgres/migrate.js";
 import { ScoreStore } from "../../src/server/adapters/postgres/score-store.js";
 import { ContentStore } from "../../src/server/adapters/postgres/content-store.js";
-import { CatalogStore } from "../../src/server/adapters/postgres/catalog-store.js";
+import { CatalogStore, RejectTagCandidate } from "../../src/server/adapters/postgres/catalog-store.js";
+import { TaskStore } from "../../src/server/adapters/postgres/task-store.js";
 import { UsageStore } from "../../src/server/adapters/postgres/usage-store.js";
+import { processContextChunks, type ScoreContextTask } from "../../src/server/application/process-context-chunks.js";
+import { runDirectScoreTask } from "../../src/server/application/run-direct-score-task.js";
+import type { AiPort } from "../../src/server/ports/ai.js";
 
 const docker = (...args: string[]) => execFileSync("docker", ["--host", "unix:///var/run/docker.sock", ...args], { encoding: "utf8" }).trim();
 let container = "";
@@ -229,11 +233,11 @@ describe("D2 enrichment migration", () => {
     const insert = "insert into article_scores(article_id,score_id,value,calculated_at,content_revision,assignment_revision) values ($1,$2,$3,now(),0,0)";
     for (const value of [-1, 101, 'NaN', 'Infinity', '-Infinity', null]) await expect(database.pool.query(insert, [articleId, score, value])).rejects.toThrow();
     const store = new ScoreStore(database.db);
-    const result = { articleId, scoreId: score, value: 75, calculatedAt: new Date('2026-01-01Z'), contentRevision: 1, assignmentRevision: 0 };
-    await store.saveSuccessful(result);
+    const result = { articleId, scoreId: score, value: 75, calculatedAt: new Date('2026-01-01Z'), contentRevision: 2, assignmentRevision: 1 };
+    expect(await store.saveSuccessful(result)).toBe(true);
     await expect(store.saveSuccessful({ ...result, value: NaN })).rejects.toThrow();
     await expect(store.saveSuccessful({ ...result, value: 80, contentRevision: -1 })).rejects.toThrow();
-    expect(await store.get(articleId, score)).toMatchObject({ value: 75, contentRevision: 1 });
+    expect(await store.get(articleId, score)).toMatchObject({ value: 75, contentRevision: 2 });
     await expect(database.pool.query("update article_scores set value='NaN' where article_id=$1", [articleId])).rejects.toThrow();
     expect((await database.pool.query("select value from article_scores where article_id=$1", [articleId])).rows[0].value).toBe(75);
     await database.pool.query("update score_definitions set active=false, deleted_at=now() where id=$1", [score]);
@@ -242,4 +246,806 @@ describe("D2 enrichment migration", () => {
     await expect(database.pool.query("delete from score_definitions where id=$1", [unreferenced.rows[0].id])).rejects.toThrow();
     expect((await database.pool.query("select value from article_scores where article_id=$1", [articleId])).rows[0].value).toBe(75);
   });
+});
+
+async function scoreFixture() {
+  const id = (await database.pool.query<{ id: string }>('insert into articles(context_id, freshrss_id, imported_at) select context_id, $2, now() from articles where id=$1 returning id', [articleId, randomUUID()])).rows[0]!.id;
+  const scoreId = (await database.pool.query<{ id: string }>("insert into score_definitions(name, description, prompt) values ('race', '', 'prompt') returning id")).rows[0]!.id;
+  const at = new Date('2026-01-01Z');
+  const content = new ContentStore(database.db);
+  const catalog = new CatalogStore(database.db);
+  const scores = new ScoreStore(database.db);
+  const tasks = new TaskStore(database.db);
+  await content.saveSuccessful(id, { text: 'original', quality: 'usable', capturedAt: at });
+  const task = await tasks.createTask({ articleId: id, action: 'prepare', generation: 1, createdAt: at, updatedAt: at });
+  const executionToken = randomUUID();
+  await tasks.claimTask(task.id, executionToken, at);
+  const tag = await catalog.createTag(`race-${randomUUID()}`);
+  const category = await catalog.createCategory(`race-${randomUUID()}`);
+  const result = { articleId: id, scoreId, value: 20, calculatedAt: at, contentRevision: 1, assignmentRevision: 0 };
+  const edits = {
+    content: () => content.publishTask({ taskId: task.id, articleId: id, action: 'prepare', generation: 1, executionToken, expectedContentRevision: 1 }, { kind: 'success', content: { text: 'new', quality: 'usable', capturedAt: at }, at }),
+    category: () => catalog.setCategory(id, category.id),
+    tag: () => catalog.changeTag(id, tag.id, true),
+  };
+  return { id, scoreId, scores, result, edits };
+}
+
+async function waitForLockWaiters(count: number) {
+  for (let i = 0; i < 100; i++) {
+    const rows = await database.pool.query<{ n: number }>("select count(*)::int n from pg_stat_activity where datname=current_database() and wait_event_type='Lock'");
+    if (rows.rows[0]!.n >= count) return;
+    await delay(20);
+  }
+  throw new Error(`expected ${count} PostgreSQL lock waiters`);
+}
+
+describe('score publication revision fence', () => {
+  it('inserts and replaces only matching bases, preserving the whole previous score on stale results', async () => {
+    const f = await scoreFixture();
+    expect(await f.scores.saveSuccessful({ ...f.result, contentRevision: 0 })).toBe(false);
+    expect(await f.scores.saveSuccessful({ ...f.result, assignmentRevision: 1 })).toBe(false);
+    expect(await f.scores.get(f.id, f.scoreId)).toBeNull();
+    expect(await f.scores.saveSuccessful(f.result)).toBe(true);
+    const replacement = { ...f.result, value: 80, calculatedAt: new Date('2026-02-01Z'), condensed: true, limited: true };
+    expect(await f.scores.saveSuccessful(replacement)).toBe(true);
+    const before = await f.scores.get(f.id, f.scoreId);
+    expect(before).toMatchObject(replacement);
+    expect(await f.edits.content()).toBe(2);
+    expect(await f.scores.saveSuccessful({ ...replacement, value: 90 })).toBe(false);
+    expect(await f.edits.tag()).toBe('ok');
+    expect(await f.scores.saveSuccessful({ ...replacement, value: 91, contentRevision: 2 })).toBe(false);
+    expect(await f.scores.get(f.id, f.scoreId)).toEqual(before);
+    expect(await f.scores.saveSuccessful({ ...replacement, value: 95, contentRevision: 2, assignmentRevision: 1 })).toBe(true);
+    expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 95, contentRevision: 2, assignmentRevision: 1 });
+    expect(await f.scores.saveSuccessful({ ...f.result, articleId: randomUUID() })).toBe(false);
+    for (const invalid of [-1, 1.5, NaN, Infinity, 2147483648]) {
+      await expect(f.scores.saveSuccessful({ ...f.result, contentRevision: invalid })).rejects.toThrow('invalid score basis revision');
+      await expect(f.scores.saveSuccessful({ ...f.result, assignmentRevision: invalid })).rejects.toThrow('invalid score basis revision');
+    }
+    expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 95 });
+  });
+
+  it.each(['content', 'category', 'tag'] as const)('serializes %s edits before and after publication without deadlock', async kind => {
+    // Hold the article so the real edit queues before the publisher.
+    const first = await scoreFixture();
+    expect(await first.scores.saveSuccessful(first.result)).toBe(true);
+    const client = await database.pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('select id from articles where id=$1 for update', [first.id]);
+      const edit = first.edits[kind]();
+      await waitForLockWaiters(1);
+      const publication = first.scores.saveSuccessful({ ...first.result, value: 70 });
+      await waitForLockWaiters(2);
+      await client.query('commit');
+      expect(await edit).toBe(kind === 'content' ? 2 : 'ok');
+      expect(await publication).toBe(false);
+      expect(await first.scores.get(first.id, first.scoreId)).toMatchObject({ value: 20 });
+    } finally {
+      await client.query('rollback');
+      client.release();
+    }
+
+    // Block the score upsert after it has locked the article; the real edit must wait.
+    const second = await scoreFixture();
+    expect(await second.scores.saveSuccessful(second.result)).toBe(true);
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select article_id from article_scores where article_id=$1 and score_id=$2 for update', [second.id, second.scoreId]);
+      const publication = second.scores.saveSuccessful({ ...second.result, value: 70 });
+      await waitForLockWaiters(1);
+      const edit = second.edits[kind]();
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      expect(await publication).toBe(true);
+      expect(await edit).toBe(kind === 'content' ? 2 : 'ok');
+      expect(await second.scores.get(second.id, second.scoreId)).toMatchObject({ value: 70, contentRevision: 1, assignmentRevision: 0 });
+      expect(await second.scores.saveSuccessful({ ...second.result, value: 90 })).toBe(false);
+      expect(await second.scores.get(second.id, second.scoreId)).toMatchObject({ value: 70 });
+    } finally {
+      await blocker.query('rollback');
+      blocker.release();
+    }
+  }, 15000);
+});
+
+async function directCandidateFixture(setup?: (scoreId: string) => Promise<void>) {
+  const f = await scoreFixture();
+  const at = new Date('2026-03-01Z');
+  await f.scores.saveSuccessful(f.result);
+  await setup?.(f.scoreId);
+  const tasks = new TaskStore(database.db);
+  const task = await tasks.createTask({ articleId: f.id, action: 'scores', scoreTargetId: f.scoreId, generation: 1, createdAt: at, updatedAt: at });
+  const token = randomUUID();
+  await tasks.claimTask(task.id, token, at);
+  const epoch = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
+  const model = { model: { provider: 'fixture', model: 'fixture' }, limits: { contextTokens: 10000, outputTokens: 10, framingTokens: 10 }, countTokens: (s: string) => Buffer.byteLength(s) };
+  const ai: AiPort = {
+    classify: async () => ({ kind: 'completed', value: { answers: { score: { type: 'score', score: 3, confidence: 1, criteria: ['0', '25', '50', '75', '100'] } }, usage: null } }),
+    generate: async () => { throw new Error('unexpected generate'); },
+    createRestrictedSession: async () => { throw new Error('unexpected session'); },
+  };
+  const input: ScoreContextTask = { owner: { taskId: task.id, executionToken: token, assignmentRevision: 0, catalogEpoch: epoch }, scoreId: f.scoreId, prompt: 'relevance', article: { id: f.id, contentRevision: 1, title: 'title', content: 'original', category: '', tagWeights: [], sourceWeight: null }, fields: { includeTitle: true, includeContent: false, includeCategory: false, includeTagWeights: false, includeSourceWeight: false }, generation: 1, classifier: model, generator: model, signal: new AbortController().signal };
+  const output = await processContextChunks(input, ai);
+  if (output.kind !== 'completed') throw new Error('expected direct score');
+  return { ...f, tasks, task, candidate: output.value, at, input, ai };
+}
+
+async function categoryCandidateFixture() {
+  const f = await scoreFixture();
+  const catalog = new CatalogStore(database.db);
+  const tasks = new TaskStore(database.db);
+  const category = await catalog.createCategory(`candidate-${randomUUID()}`);
+  const at = new Date('2026-03-01Z');
+  const task = await tasks.createTask({ articleId: f.id, action: 'category', generation: 1, createdAt: at, updatedAt: at });
+  const executionToken = randomUUID();
+  await tasks.claimTask(task.id, executionToken, at);
+  const catalogEpoch = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
+  const candidate = { taskId: task.id, executionToken, articleId: f.id, generation: 1, prerequisiteId: null, contentRevision: 1, contentText: 'original', assignmentRevision: 0, catalogEpoch, categoryId: category.id };
+  const article = async () => (await database.pool.query('select category_id, content_revision, assignment_revision from articles where id=$1', [f.id])).rows[0];
+  return { ...f, catalog, tasks, task, category, at, candidate, article };
+}
+
+describe('category candidate publication', () => {
+  it('lets the caller roll back category publication with its other work', async () => {
+    const f = await categoryCandidateFixture();
+    const before = await f.article(), task = await f.tasks.getTask(f.task.id);
+    await expect(database.db.transaction(async tx => {
+      const published = await f.catalog.publishCategoryCandidateInTransaction(tx, f.candidate, f.at);
+      expect(published).toMatchObject({ assignmentRevision: 1, receipt: { taskId: f.task.id, action: 'category' } });
+      throw new Error('caller rollback');
+    })).rejects.toThrow('caller rollback');
+    expect(await f.article()).toEqual(before);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(task);
+  });
+
+  it('publishes a change and completes the task atomically', async () => {
+    const f = await categoryCandidateFixture();
+    expect(await f.catalog.publishCategoryCandidate(f.candidate, f.at)).toMatchObject({ assignmentRevision: 1 });
+    expect(await f.article()).toMatchObject({ category_id: f.category.id, assignment_revision: 1 });
+    expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded', updatedAt: f.at, endedAt: f.at, errorCode: null });
+    expect(await f.catalog.publishCategoryCandidate(f.candidate, f.at)).toBeNull();
+  });
+
+  it('succeeds without incrementing the revision for the same category', async () => {
+    const f = await categoryCandidateFixture();
+    expect(await f.catalog.publishCategoryCandidate({ ...f.candidate, categoryId: fallback.toUpperCase() }, f.at)).toMatchObject({ assignmentRevision: 0 });
+    expect(await f.article()).toMatchObject({ category_id: fallback, assignment_revision: 0 });
+    expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded' });
+  });
+
+  it('rejects invalid, missing or stale bases without changing either row', async () => {
+    const f = await categoryCandidateFixture();
+    const beforeArticle = await f.article(), beforeTask = await f.tasks.getTask(f.task.id), b = f.candidate;
+    const bad = [
+      { ...b, taskId: randomUUID() }, { ...b, executionToken: randomUUID() }, { ...b, articleId: randomUUID() },
+      { ...b, categoryId: randomUUID() }, { ...b, contentRevision: 2 }, { ...b, assignmentRevision: 1 },
+      { ...b, generation: 2 }, { ...b, catalogEpoch: b.catalogEpoch + 1 }, { ...b, executionToken: 'invalid' },
+      { ...b, generation: -1 }, { ...b, assignmentRevision: NaN },
+    ];
+    for (const candidate of bad) expect(await f.catalog.publishCategoryCandidate(candidate, f.at)).toBeNull();
+    expect(await f.catalog.publishCategoryCandidate(b, new Date(NaN))).toBeNull();
+    expect(await f.article()).toEqual(beforeArticle);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+  });
+
+  it.each(['newer', 'action', 'state', 'task-article', 'archived', 'epoch', 'content', 'assignment'] as const)('rejects changed %s and preserves current state', async change => {
+    const f = await categoryCandidateFixture();
+    if (change === 'newer') await f.tasks.createTask({ articleId: f.id, action: 'category', generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at });
+    if (change === 'action') await database.pool.query("update processing_tasks set action='summary' where id=$1", [f.task.id]);
+    if (change === 'state') await database.pool.query("update processing_tasks set state='failed' where id=$1", [f.task.id]);
+    if (change === 'task-article') await database.pool.query('update processing_tasks set article_id=$2 where id=$1', [f.task.id, articleId]);
+    if (change === 'archived') await database.pool.query('update categories set archived_at=now() where id=$1', [f.category.id]);
+    if (change === 'epoch') await f.catalog.createCategory(`new-${randomUUID()}`);
+    if (change === 'content') await f.edits.content();
+    if (change === 'assignment') await f.edits.tag();
+    const beforeArticle = await f.article(), beforeTask = await f.tasks.getTask(f.task.id);
+    expect(await f.catalog.publishCategoryCandidate(f.candidate, f.at)).toBeNull();
+    expect(await f.article()).toEqual(beforeArticle);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+  });
+
+  it('rolls back the assignment when task success fails', async () => {
+    const f = await categoryCandidateFixture();
+    const beforeArticle = await f.article(), beforeTask = await f.tasks.getTask(f.task.id);
+    await database.pool.query(`create function fail_category_success() returns trigger language plpgsql as $$ begin if new.id = '${f.task.id}'::uuid and new.state = 'succeeded' then raise exception 'test category task failure'; end if; return new; end $$`);
+    await database.pool.query('create trigger fail_category_success before update on processing_tasks for each row execute function fail_category_success()');
+    try {
+      await expect(f.catalog.publishCategoryCandidate(f.candidate, f.at)).rejects.toMatchObject({ cause: expect.objectContaining({ message: 'test category task failure' }) });
+      expect(await f.article()).toEqual(beforeArticle);
+      expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+    } finally {
+      await database.pool.query('drop trigger fail_category_success on processing_tasks');
+      await database.pool.query('drop function fail_category_success()');
+    }
+  });
+
+  it('advances the epoch only for successful category creation', async () => {
+    const f = await categoryCandidateFixture();
+    await expect(f.catalog.createCategory(f.category.label)).rejects.toThrow();
+    expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(f.candidate.catalogEpoch);
+    await f.catalog.createCategory(`new-${randomUUID()}`);
+    expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(f.candidate.catalogEpoch + 1);
+    expect(await f.catalog.publishCategoryCandidate(f.candidate, f.at)).toBeNull();
+  });
+
+  it('serializes competing publications and newer task creation', async () => {
+    const f = await categoryCandidateFixture();
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from articles where id=$1 for update', [f.id]);
+      const newer = f.tasks.createTask({ articleId: f.id, action: 'category', generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at });
+      await waitForLockWaiters(1);
+      const publication = f.catalog.publishCategoryCandidate(f.candidate, f.at);
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      await newer;
+      expect(await publication).toBeNull();
+      expect(await f.article()).toMatchObject({ category_id: fallback, assignment_revision: 0 });
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
+    } finally { await blocker.query('rollback'); blocker.release(); }
+
+    const second = await categoryCandidateFixture();
+    const results = await Promise.all([second.catalog.publishCategoryCandidate(second.candidate, second.at), second.catalog.publishCategoryCandidate(second.candidate, second.at)]);
+    expect(results.filter(result => result !== null)).toMatchObject([{ assignmentRevision: 1 }]);
+    expect(results.filter(result => result === null)).toHaveLength(1);
+    expect(await second.article()).toMatchObject({ category_id: second.category.id, assignment_revision: 1 });
+    expect(await second.tasks.getTask(second.task.id)).toMatchObject({ state: 'succeeded' });
+  }, 15000);
+
+  it.each(['create', 'archive'] as const)('serializes category %s and publication in both orders', async kind => {
+    const first = await categoryCandidateFixture();
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from catalog_epoch where id=1 for update');
+      const mutation = kind === 'create' ? first.catalog.createCategory(`race-${randomUUID()}`) : first.catalog.archiveCategory(first.category.id, first.at);
+      await waitForLockWaiters(1);
+      const publication = first.catalog.publishCategoryCandidate(first.candidate, first.at);
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      await mutation;
+      expect(await publication).toBeNull();
+      expect(await first.article()).toMatchObject({ category_id: fallback, assignment_revision: 0 });
+      expect(await first.tasks.getTask(first.task.id)).toMatchObject({ state: 'running' });
+    } finally { await blocker.query('rollback'); blocker.release(); }
+
+    const second = await categoryCandidateFixture();
+    const taskBlocker = await database.pool.connect();
+    try {
+      await taskBlocker.query('begin');
+      await taskBlocker.query('select id from processing_tasks where id=$1 for update', [second.task.id]);
+      const publication = second.catalog.publishCategoryCandidate(second.candidate, second.at);
+      await waitForLockWaiters(1);
+      const mutation = kind === 'create' ? second.catalog.createCategory(`race-${randomUUID()}`) : second.catalog.archiveCategory(second.category.id, second.at);
+      await waitForLockWaiters(2);
+      await taskBlocker.query('commit');
+      expect(await publication).toMatchObject({ assignmentRevision: 1 });
+      await mutation;
+      expect(await second.article()).toMatchObject({ category_id: second.category.id, assignment_revision: 1 });
+      expect(await second.tasks.getTask(second.task.id)).toMatchObject({ state: 'succeeded' });
+    } finally { await taskBlocker.query('rollback'); taskBlocker.release(); }
+  }, 15000);
+});
+
+async function tagCandidateFixture(setup?: (catalog: CatalogStore, id: string) => Promise<void>) {
+  const f = await categoryCandidateFixture();
+  expect(await f.catalog.publishCategoryCandidate(f.candidate, f.at)).toMatchObject({ assignmentRevision: 1 });
+  await setup?.(f.catalog, f.id);
+  const task = await f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 1, prerequisiteId: f.task.id, createdAt: f.at, updatedAt: f.at });
+  const executionToken = randomUUID();
+  await f.tasks.claimTask(task.id, executionToken, f.at);
+  const catalogEpoch = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
+  const candidate = { taskId: task.id, executionToken, articleId: f.id, generation: 1, title: null, contentRevision: 1, contentText: 'original', categoryId: f.category.id, assignmentRevision: (await f.article()).assignment_revision as number, catalogEpoch, prerequisiteTaskId: f.task.id, prerequisiteGeneration: 1, categoryPrerequisiteId: null, labels: [] as string[] };
+  return { ...f, categoryTask: f.task, task, candidate };
+}
+
+describe('tag candidate publication', () => {
+  it('rolls back caller-owned publication and propagates late rejection out of the transaction', async () => {
+    let archived = '';
+    const f = await tagCandidateFixture(async catalog => {
+      archived = `archived-${randomUUID()}`;
+      const tag = await catalog.createTag(archived);
+      await catalog.archiveTag(tag.id, new Date());
+    });
+    const label = `rollback-${randomUUID()}`;
+    const before = await f.article(), task = await f.tasks.getTask(f.task.id);
+    await expect(database.db.transaction(async tx => {
+      await f.catalog.publishTagCandidateInTransaction(tx, { ...f.candidate, labels: [label, archived] }, f.at);
+    })).rejects.toBeInstanceOf(RejectTagCandidate);
+    await expect(database.db.transaction(async tx => {
+      expect(await f.catalog.publishTagCandidateInTransaction(tx, { ...f.candidate, labels: [label] }, f.at)).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+      throw new Error('caller rollback');
+    })).rejects.toThrow('caller rollback');
+    expect((await database.pool.query('select id from tags where label=$1', [label])).rowCount).toBe(0);
+    expect(await f.article()).toEqual(before);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(task);
+    expect(await f.catalog.listArticleTags(f.id)).toHaveLength(0);
+    expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(f.candidate.catalogEpoch);
+  });
+
+  it('accepts an empty list without changing revisions', async () => {
+    const f = await tagCandidateFixture();
+    expect(await f.catalog.publishTagCandidate(f.candidate, f.at)).toEqual({ assignmentRevision: 1, catalogEpoch: f.candidate.catalogEpoch });
+    expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded', endedAt: f.at });
+  });
+
+  it('preserves existing labels, offsets and feedback, deduplicates using PostgreSQL casefold and increments once', async () => {
+    const suffix = randomUUID();
+    let existingId = '';
+    const f = await tagCandidateFixture(async (catalog, id) => {
+      const tag = await catalog.createTag(`Straße ${suffix}`);
+      existingId = tag.id;
+      await database.pool.query('update tags set manual_offset=3 where id=$1', [tag.id]);
+      await database.pool.query('insert into tag_votes(article_id, tag_id, value, voted_at) values ($1,$2,1,now())', [id, tag.id]);
+    });
+    const labels = [`STRASSE ${suffix}`, `new ${suffix}`, `NEW ${suffix}`, `Straße ${suffix}`];
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels }, f.at)).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+    expect(await f.catalog.listArticleTags(f.id)).toHaveLength(2);
+    expect((await database.pool.query('select label, manual_offset from tags where id=$1', [existingId])).rows[0]).toEqual({ label: `Straße ${suffix}`, manual_offset: 3 });
+    expect((await database.pool.query('select value from tag_votes where article_id=$1 and tag_id=$2', [f.id, existingId])).rows).toEqual([{ value: 1 }]);
+    const second = await f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 2, prerequisiteId: f.categoryTask.id, createdAt: f.at, updatedAt: f.at });
+    const token = randomUUID(); await f.tasks.claimTask(second.id, token, f.at);
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, taskId: second.id, executionToken: token, generation: 2, assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, labels }, f.at)).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+  });
+
+  it('keeps manual associations when publishing other tags', async () => {
+    let manualId = '';
+    const f = await tagCandidateFixture(async (catalog, id) => {
+      const manual = await catalog.createTag(`manual-${randomUUID()}`);
+      manualId = manual.id;
+      expect(await catalog.attachTag(id, manualId)).toBe(true);
+    });
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels: [`generated-${randomUUID()}`] }, f.at)).toEqual({ assignmentRevision: 3, catalogEpoch: f.candidate.catalogEpoch + 1 });
+    const assigned = await f.catalog.listArticleTags(f.id);
+    expect(assigned).toHaveLength(2);
+    expect(assigned.some(tag => tag.id === manualId)).toBe(true);
+  });
+
+  it('rejects invalid and stale candidates without writes', async () => {
+    const f = await tagCandidateFixture();
+    const b = { ...f.candidate, labels: [`never-${randomUUID()}`] };
+    const before = await f.article(), task = await f.tasks.getTask(f.task.id);
+    const bad = [
+      { ...b, taskId: randomUUID() }, { ...b, executionToken: randomUUID() }, { ...b, articleId: randomUUID() },
+      { ...b, prerequisiteTaskId: randomUUID() }, { ...b, generation: 2 }, { ...b, contentRevision: 2 },
+      { ...b, assignmentRevision: 2 }, { ...b, catalogEpoch: b.catalogEpoch + 1 }, { ...b, executionToken: 'bad' },
+      { ...b, labels: Array(11).fill('x') }, { ...b, labels: ['  '] }, { ...b, labels: [1] as unknown as string[] }, { ...b, labels: Array(1) as string[] },
+    ];
+    for (const candidate of bad) expect(await f.catalog.publishTagCandidate(candidate, f.at)).toBeNull();
+    expect(await f.article()).toEqual(before);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(task);
+    expect(await f.catalog.listArticleTags(f.id)).toHaveLength(0);
+  });
+
+  it.each(['newer', 'task-article', 'action', 'state', 'prerequisite-missing', 'prerequisite-action', 'prerequisite-failed', 'prerequisite-article', 'content', 'assignment', 'epoch'] as const)('rejects changed %s', async change => {
+    const f = await tagCandidateFixture();
+    if (change === 'newer') await f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at });
+    if (change === 'task-article') await database.pool.query('update processing_tasks set article_id=$2 where id=$1', [f.task.id, articleId]);
+    if (change === 'action') await database.pool.query("update processing_tasks set action='summary' where id=$1", [f.task.id]);
+    if (change === 'state') await database.pool.query("update processing_tasks set state='failed' where id=$1", [f.task.id]);
+    if (change === 'prerequisite-missing') await database.pool.query('update processing_tasks set prerequisite_id=null where id=$1', [f.task.id]);
+    if (change === 'prerequisite-action') await database.pool.query("update processing_tasks set action='summary' where id=$1", [f.categoryTask.id]);
+    if (change === 'prerequisite-failed') await database.pool.query("update processing_tasks set state='failed' where id=$1", [f.categoryTask.id]);
+    if (change === 'prerequisite-article') await database.pool.query('update processing_tasks set article_id=$2 where id=$1', [f.categoryTask.id, articleId]);
+    if (change === 'content') await f.edits.content();
+    if (change === 'assignment') await f.edits.tag();
+    if (change === 'epoch') await f.catalog.createTag(`epoch-${randomUUID()}`);
+    const before = await f.article(), task = await f.tasks.getTask(f.task.id);
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels: [`never-${randomUUID()}`] }, f.at)).toBeNull();
+    expect(await f.article()).toEqual(before);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(task);
+  });
+
+  it('rolls back new tags and associations on archived identity or task update failure', async () => {
+    let archived = '';
+    const f = await tagCandidateFixture(async catalog => {
+      archived = `archived-${randomUUID()}`;
+      const tag = await catalog.createTag(archived);
+      await catalog.archiveTag(tag.id, new Date());
+    });
+    const label = `rollback-${randomUUID()}`;
+    const before = await f.article(), task = await f.tasks.getTask(f.task.id);
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels: [label, archived.toUpperCase()] }, f.at)).toBeNull();
+    expect((await database.pool.query('select id from tags where label=$1', [label])).rowCount).toBe(0);
+    await database.pool.query(`create function fail_tag_success() returns trigger language plpgsql as $$ begin if new.id = '${f.task.id}'::uuid and new.state = 'succeeded' then raise exception 'test tag task failure'; end if; return new; end $$`);
+    await database.pool.query('create trigger fail_tag_success before update on processing_tasks for each row execute function fail_tag_success()');
+    try {
+      await expect(f.catalog.publishTagCandidate({ ...f.candidate, labels: [label] }, f.at)).rejects.toThrow();
+      expect((await database.pool.query('select id from tags where label=$1', [label])).rowCount).toBe(0);
+      expect(await f.article()).toEqual(before);
+      expect(await f.tasks.getTask(f.task.id)).toEqual(task);
+      expect(await f.catalog.listArticleTags(f.id)).toHaveLength(0);
+      expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(f.candidate.catalogEpoch);
+    } finally {
+      await database.pool.query('drop trigger fail_tag_success on processing_tasks');
+      await database.pool.query('drop function fail_tag_success()');
+    }
+  });
+
+  it.each(['newer', 'assignment', 'content'] as const)('serializes a concurrent %s before publication', async change => {
+    const f = await tagCandidateFixture();
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from articles where id=$1 for update', [f.id]);
+      const mutation = change === 'newer' ? f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at }) : f.edits[change === 'assignment' ? 'tag' : 'content']();
+      await waitForLockWaiters(1);
+      const publication = f.catalog.publishTagCandidate({ ...f.candidate, labels: [`race-${randomUUID()}`] }, f.at);
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      await mutation;
+      expect(await publication).toBeNull();
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
+    } finally { await blocker.query('rollback'); blocker.release(); }
+  }, 15000);
+
+  it.each(['newer', 'assignment', 'content'] as const)('serializes publication before a concurrent %s', async change => {
+    const f = await tagCandidateFixture();
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from processing_tasks where id=$1 for update', [f.task.id]);
+      const publication = f.catalog.publishTagCandidate({ ...f.candidate, labels: [`race-${randomUUID()}`] }, f.at);
+      await waitForLockWaiters(1);
+      const mutation = change === 'newer' ? f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at }) : f.edits[change === 'assignment' ? 'tag' : 'content']();
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      expect(await publication).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+      await mutation;
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded' });
+    } finally { await blocker.query('rollback'); blocker.release(); }
+  }, 15000);
+
+  it('does not deadlock a concurrent manual attachment of the same tag', async () => {
+    let tag: Awaited<ReturnType<CatalogStore['createTag']>>;
+    const f = await tagCandidateFixture(async catalog => { tag = await catalog.createTag(`same-${randomUUID()}`); });
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from processing_tasks where id=$1 for update', [f.task.id]);
+      const publication = f.catalog.publishTagCandidate({ ...f.candidate, labels: [tag!.label] }, f.at);
+      await waitForLockWaiters(1);
+      const edit = f.catalog.changeTag(f.id, tag!.id, true);
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      expect(await publication).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch });
+      expect(await edit).toBe('ok');
+      expect(await f.article()).toMatchObject({ assignment_revision: 2 });
+    } finally { await blocker.query('rollback'); blocker.release(); }
+  }, 15000);
+
+  it.each(['create', 'archive'] as const)('serializes tag %s and publication in both orders', async change => {
+    const tag = await new CatalogStore(database.db).createTag(`catalog-race-${randomUUID()}`);
+    const first = await tagCandidateFixture();
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from catalog_epoch where id=1 for update');
+      const mutation = change === 'create' ? first.catalog.createTag(`race-${randomUUID()}`) : first.catalog.archiveTag(tag.id, first.at);
+      await waitForLockWaiters(1);
+      const publication = first.catalog.publishTagCandidate(first.candidate, first.at);
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      await mutation;
+      expect(await publication).toBeNull();
+    } finally { await blocker.query('rollback'); blocker.release(); }
+
+    const other = await new CatalogStore(database.db).createTag(`catalog-race-${randomUUID()}`);
+    const second = await tagCandidateFixture();
+    const taskBlocker = await database.pool.connect();
+    try {
+      await taskBlocker.query('begin');
+      await taskBlocker.query('select id from processing_tasks where id=$1 for update', [second.task.id]);
+      const publication = second.catalog.publishTagCandidate(second.candidate, second.at);
+      await waitForLockWaiters(1);
+      const mutation = change === 'create' ? second.catalog.createTag(`race-${randomUUID()}`) : second.catalog.archiveTag(other.id, second.at);
+      await waitForLockWaiters(2);
+      await taskBlocker.query('commit');
+      expect(await publication).toEqual({ assignmentRevision: 1, catalogEpoch: second.candidate.catalogEpoch });
+      await mutation;
+    } finally { await taskBlocker.query('rollback'); taskBlocker.release(); }
+  }, 15000);
+
+  it('rolls back tag creation and archival when the epoch update fails', async () => {
+    const f = await tagCandidateFixture();
+    const existing = await f.catalog.createTag(`archive-rollback-${randomUUID()}`);
+    const label = `create-rollback-${randomUUID()}`;
+    const before = (await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision;
+    await database.pool.query("create function fail_tag_epoch() returns trigger language plpgsql as $$ begin raise exception 'test tag epoch failure'; end $$");
+    await database.pool.query('create trigger fail_tag_epoch before update on catalog_epoch for each row execute function fail_tag_epoch()');
+    try {
+      await expect(f.catalog.createTag(label)).rejects.toThrow();
+      await expect(f.catalog.archiveTag(existing.id, f.at)).rejects.toThrow();
+      expect((await database.pool.query('select id from tags where label=$1', [label])).rowCount).toBe(0);
+      expect((await database.pool.query('select archived_at from tags where id=$1', [existing.id])).rows[0].archived_at).toBeNull();
+      expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(before);
+    } finally {
+      await database.pool.query('drop trigger fail_tag_epoch on catalog_epoch');
+      await database.pool.query('drop function fail_tag_epoch()');
+    }
+  });
+
+  it('advances epoch exactly once for creation and archival, not failed or repeated mutations', async () => {
+    const f = await tagCandidateFixture();
+    const tag = await f.catalog.createTag(`epoch-${randomUUID()}`);
+    await expect(f.catalog.createTag(tag.label)).rejects.toThrow();
+    expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(f.candidate.catalogEpoch + 1);
+    await f.catalog.archiveTag(tag.id, f.at);
+    await f.catalog.archiveTag(tag.id, f.at);
+    expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(f.candidate.catalogEpoch + 2);
+    expect(await f.catalog.publishTagCandidate(f.candidate, f.at)).toBeNull();
+  });
+});
+
+describe('direct score candidate publication', () => {
+  it('runs a synthetic direct task through atomic score publication', async () => {
+    const f = await directCandidateFixture();
+    expect(await runDirectScoreTask(f.input, { ai: f.ai, scores: f.scores, tasks: f.tasks, now: () => f.at })).toEqual({ kind: 'published' });
+    expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 75, calculatedAt: f.at, contentRevision: 1, assignmentRevision: 0 });
+    expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded', endedAt: f.at });
+  });
+
+  it('rolls back the runner publication if task success fails', async () => {
+    const f = await directCandidateFixture();
+    const previousScore = await f.scores.get(f.id, f.scoreId);
+    await database.pool.query(`create function fail_runner_success() returns trigger language plpgsql as $$ begin if new.id = '${f.task.id}'::uuid and new.state = 'succeeded' then raise exception 'synthetic failure'; end if; return new; end $$`);
+    await database.pool.query('create trigger fail_runner_success before update on processing_tasks for each row execute function fail_runner_success()');
+    try {
+      await expect(runDirectScoreTask(f.input, { ai: f.ai, scores: f.scores, tasks: f.tasks, now: () => f.at })).rejects.toThrow('Score publication failed');
+      expect(await f.scores.get(f.id, f.scoreId)).toEqual(previousScore);
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
+    } finally {
+      await database.pool.query('drop trigger fail_runner_success on processing_tasks');
+      await database.pool.query('drop function fail_runner_success()');
+    }
+  });
+
+  it('publishes score and task together, and refuses a second publication', async () => {
+    const f = await directCandidateFixture();
+    expect(await f.scores.publishCandidate(f.candidate, f.at)).toBe(true);
+    expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 75, calculatedAt: f.at, contentRevision: 1, assignmentRevision: 0, condensed: false, limited: false });
+    expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded', endedAt: f.at, updatedAt: f.at, errorCode: null });
+    expect(await f.scores.publishCandidate(f.candidate, f.at)).toBe(false);
+  });
+
+  it('rejects stale or invalid captured bases without changing either row', async () => {
+    const f = await directCandidateFixture();
+    const beforeScore = await f.scores.get(f.id, f.scoreId);
+    const beforeTask = await f.tasks.getTask(f.task.id);
+    const b = f.candidate.basis;
+    const bad = [
+      { ...b, taskId: randomUUID() }, { ...b, executionToken: randomUUID() }, { ...b, articleId: randomUUID() },
+      { ...b, scoreId: randomUUID() }, { ...b, contentRevision: 2 }, { ...b, assignmentRevision: 1 },
+      { ...b, generation: 2 }, { ...b, catalogEpoch: b.catalogEpoch + 1 }, { ...b, executionToken: 'invalid' },
+    ];
+    for (const basis of bad) expect(await f.scores.publishCandidate({ ...f.candidate, basis }, f.at)).toBe(false);
+    expect(await f.scores.publishCandidate({ ...f.candidate, value: NaN }, f.at)).toBe(false);
+    expect(await f.scores.get(f.id, f.scoreId)).toEqual(beforeScore);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+  });
+
+  it.each(['newer', 'target', 'action', 'state', 'disabled', 'deleted', 'epoch', 'content', 'assignment'] as const)('preserves old score when %s changes', async change => {
+    const f = await directCandidateFixture();
+    const beforeScore = await f.scores.get(f.id, f.scoreId);
+    if (change === 'newer') await f.tasks.createTask({ articleId: f.id, action: 'scores', scoreTargetId: f.scoreId, generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at });
+    if (change === 'target') await database.pool.query('update processing_tasks set score_target_id=$2 where id=$1', [f.task.id, randomUUID()]);
+    if (change === 'action') await database.pool.query("update processing_tasks set action='summary' where id=$1", [f.task.id]);
+    if (change === 'state') await database.pool.query("update processing_tasks set state='failed' where id=$1", [f.task.id]);
+    if (change === 'disabled') await database.pool.query('update score_definitions set active=false where id=$1', [f.scoreId]);
+    if (change === 'deleted') await database.pool.query('update score_definitions set deleted_at=now() where id=$1', [f.scoreId]);
+    if (change === 'epoch') await database.pool.query('update catalog_epoch set revision=revision+1 where id=1');
+    if (change === 'content') await f.edits.content();
+    if (change === 'assignment') await f.edits.tag();
+    const beforeTask = await f.tasks.getTask(f.task.id);
+    expect(await f.scores.publishCandidate(f.candidate, f.at)).toBe(false);
+    expect(await f.scores.get(f.id, f.scoreId)).toEqual(beforeScore);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+  });
+
+  it.each(['create', 'save', 'update', 'delete', 'prompt-insert', 'prompt-update', 'prompt-delete', 'model-role', 'category-rename', 'category-archive', 'tag-rename'] as const)('fences publication after catalog writer %s', async kind => {
+    const catalog = new CatalogStore(database.db);
+    const category = await catalog.createCategory(`epoch-${randomUUID()}`);
+    const tag = await catalog.createTag(`epoch-${randomUUID()}`);
+    const f = await directCandidateFixture(async scoreId => {
+      if (kind === 'prompt-update' || kind === 'prompt-delete') {
+        expect(await catalog.saveScoreCategoryPrompt(scoreId, category.id, 'before')).toBe('ok');
+      }
+    });
+    const beforeScore = await f.scores.get(f.id, f.scoreId), beforeTask = await f.tasks.getTask(f.task.id);
+    const definition = (await catalog.listScoreDefinitions()).find(row => row.id === f.scoreId)!;
+    const input = { name: definition.name, description: definition.description, prompt: 'changed', active: definition.active, includeTitle: definition.includeTitle, includeContent: definition.includeContent, includeCategory: definition.includeCategory, includeTagWeights: definition.includeTagWeights, includeSourceWeight: definition.includeSourceWeight };
+    if (kind === 'create') await catalog.createScoreDefinition(input);
+    if (kind === 'save') await catalog.saveScoreDefinition(f.scoreId, input);
+    if (kind === 'update') await catalog.updateScoreDefinition(f.scoreId, { prompt: 'changed' });
+    if (kind === 'delete') await catalog.deleteScoreDefinition(f.scoreId, f.at);
+    if (kind === 'prompt-insert' || kind === 'prompt-update') expect(await catalog.saveScoreCategoryPrompt(f.scoreId, category.id, 'changed')).toBe('ok');
+    if (kind === 'prompt-delete') expect(await catalog.deleteScoreCategoryPrompt(f.scoreId, category.id)).toBe('ok');
+    if (kind === 'model-role') await catalog.saveModelRole({ role: 'scores', primary: { provider: 'fixture', model: randomUUID() }, fallback: null });
+    if (kind === 'category-rename') await catalog.renameCategory(category.id, `changed-${randomUUID()}`);
+    if (kind === 'category-archive') await catalog.archiveCategory(category.id, f.at);
+    if (kind === 'tag-rename') await catalog.renameTag(tag.id, `changed-${randomUUID()}`);
+    expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(f.candidate.basis.catalogEpoch + 1);
+    expect(await f.scores.publishCandidate(f.candidate, f.at)).toBe(false);
+    expect(await f.scores.get(f.id, f.scoreId)).toEqual(beforeScore);
+    expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+  });
+
+  it('does not advance the epoch for no-ops, missing targets, or rejected mutations', async () => {
+    const catalog = new CatalogStore(database.db);
+    const f = await directCandidateFixture();
+    const category = await catalog.createCategory(`noop-${randomUUID()}`);
+    const duplicate = await catalog.createCategory(`collision-${randomUUID()}`);
+    const tag = await catalog.createTag(`noop-${randomUUID()}`);
+    const definition = (await catalog.listScoreDefinitions()).find(row => row.id === f.scoreId)!;
+    const input = { name: definition.name, description: definition.description, prompt: definition.prompt, active: definition.active, includeTitle: definition.includeTitle, includeContent: definition.includeContent, includeCategory: definition.includeCategory, includeTagWeights: definition.includeTagWeights, includeSourceWeight: definition.includeSourceWeight };
+    const role = { role: 'scores' as const, primary: { provider: 'fixture', model: randomUUID() }, fallback: null };
+    await catalog.saveModelRole(role);
+    await catalog.saveScoreCategoryPrompt(f.scoreId, category.id, 'same');
+    const stillValid = await directCandidateFixture();
+    const epoch = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
+    await catalog.saveScoreDefinition(f.scoreId, input);
+    await catalog.updateScoreDefinition(f.scoreId, { prompt: input.prompt });
+    expect(await catalog.updateScoreDefinition(randomUUID(), { prompt: 'changed' })).toBeNull();
+    expect(await catalog.deleteScoreDefinition(randomUUID(), f.at)).toBeNull();
+    await catalog.saveScoreCategoryPrompt(f.scoreId, category.id, 'same');
+    expect(await catalog.saveScoreCategoryPrompt(randomUUID(), category.id, 'missing')).toBe('not_found');
+    expect(await catalog.saveScoreCategoryPrompt(f.scoreId, fallback, 'invalid')).toBe('invalid_category');
+    await catalog.saveModelRole(role);
+    await catalog.renameCategory(category.id, category.label);
+    await catalog.renameTag(tag.id, tag.label);
+    expect(await catalog.renameCategory(randomUUID(), 'missing')).toBeNull();
+    expect(await catalog.renameTag(randomUUID(), 'missing')).toBeNull();
+    expect(await catalog.archiveCategory(randomUUID(), f.at)).toBeNull();
+    await expect(catalog.renameCategory(category.id, duplicate.label)).rejects.toThrow();
+    expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(epoch);
+    expect(await stillValid.scores.publishCandidate(stillValid.candidate, stillValid.at)).toBe(true);
+    await catalog.deleteScoreCategoryPrompt(f.scoreId, category.id);
+    await catalog.deleteScoreDefinition(f.scoreId, f.at);
+    await catalog.archiveCategory(category.id, f.at);
+    const after = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
+    await catalog.deleteScoreDefinition(f.scoreId, f.at);
+    await catalog.archiveCategory(category.id, f.at);
+    expect(await catalog.saveScoreCategoryPrompt(f.scoreId, category.id, 'deleted')).toBe('deleted');
+    expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(after);
+    const other = await catalog.createCategory(`noop-delete-${randomUUID()}`);
+    const last = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
+    const active = await catalog.createScoreDefinition({ ...input, name: 'other' });
+    const created = last + 1;
+    expect(await catalog.deleteScoreCategoryPrompt(active.id, other.id)).toBe('ok');
+    expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(created);
+  });
+
+  it('rolls back a configuration mutation when the epoch update fails', async () => {
+    const catalog = new CatalogStore(database.db);
+    const f = await directCandidateFixture();
+    const before = (await catalog.listScoreDefinitions()).find(row => row.id === f.scoreId);
+    await database.pool.query("create function fail_epoch_update() returns trigger language plpgsql as $$ begin raise exception 'test epoch failure'; end $$");
+    await database.pool.query('create trigger fail_epoch_update before update on catalog_epoch for each row execute function fail_epoch_update()');
+    try {
+      await expect(catalog.updateScoreDefinition(f.scoreId, { prompt: 'rolled back' })).rejects.toThrow();
+      expect((await catalog.listScoreDefinitions()).find(row => row.id === f.scoreId)).toEqual(before);
+      expect((await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision).toBe(f.candidate.basis.catalogEpoch);
+      expect(await f.scores.publishCandidate(f.candidate, f.at)).toBe(true);
+    } finally {
+      await database.pool.query('drop trigger fail_epoch_update on catalog_epoch');
+      await database.pool.query('drop function fail_epoch_update()');
+    }
+  });
+
+  it('takes the epoch before a definition lock for real writers', async () => {
+    const f = await directCandidateFixture();
+    const client = await database.pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('select id from score_definitions where id=$1 for update', [f.scoreId]);
+      const mutation = new CatalogStore(database.db).updateScoreDefinition(f.scoreId, { prompt: 'concurrent' });
+      await waitForLockWaiters(1);
+      const publication = f.scores.publishCandidate(f.candidate, f.at);
+      await waitForLockWaiters(2);
+      await client.query('commit');
+      await mutation;
+      expect(await publication).toBe(false);
+      expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 20 });
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
+    } finally { await client.query('rollback'); client.release(); }
+  }, 15000);
+
+  it('ignores a newer generation for a different score target', async () => {
+    const f = await directCandidateFixture();
+    await f.tasks.createTask({ articleId: f.id, action: 'scores', scoreTargetId: randomUUID(), generation: 2, createdAt: f.at, updatedAt: f.at });
+    expect(await f.scores.publishCandidate(f.candidate, f.at)).toBe(true);
+  });
+
+  it('rejects a different existing active target', async () => {
+    const f = await directCandidateFixture();
+    const other = (await database.pool.query<{ id: string }>("insert into score_definitions(name,description,prompt) values ('other','','prompt') returning id")).rows[0]!.id;
+    const before = await f.tasks.getTask(f.task.id);
+    expect(await f.scores.publishCandidate({ ...f.candidate, basis: { ...f.candidate.basis, scoreId: other } }, f.at)).toBe(false);
+    expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 20 });
+    expect(await f.scores.get(f.id, other)).toBeNull();
+    expect(await f.tasks.getTask(f.task.id)).toEqual(before);
+  });
+
+  it('rolls back the score if the task success update fails', async () => {
+    const f = await directCandidateFixture();
+    const beforeScore = await f.scores.get(f.id, f.scoreId), beforeTask = await f.tasks.getTask(f.task.id);
+    await database.pool.query(`create function fail_candidate_success() returns trigger language plpgsql as $$ begin if new.id = '${f.task.id}'::uuid and new.state = 'succeeded' then raise exception 'test task failure'; end if; return new; end $$`);
+    await database.pool.query('create trigger fail_candidate_success before update on processing_tasks for each row execute function fail_candidate_success()');
+    try {
+      await expect(f.scores.publishCandidate(f.candidate, f.at)).rejects.toMatchObject({ cause: expect.objectContaining({ message: 'test task failure' }) });
+      expect(await f.scores.get(f.id, f.scoreId)).toEqual(beforeScore);
+      expect(await f.tasks.getTask(f.task.id)).toEqual(beforeTask);
+    } finally {
+      await database.pool.query('drop trigger fail_candidate_success on processing_tasks');
+      await database.pool.query('drop function fail_candidate_success()');
+    }
+  });
+
+  it('serializes newer task creation on the article lock in both orders', async () => {
+    const first = await directCandidateFixture();
+    const blocker = await database.pool.connect();
+    try {
+      await blocker.query('begin');
+      await blocker.query('select id from articles where id=$1 for update', [first.id]);
+      const newer = first.tasks.createTask({ articleId: first.id, action: 'scores', scoreTargetId: first.scoreId, generation: 2, createdAt: first.at, updatedAt: first.at });
+      await waitForLockWaiters(1);
+      const publication = first.scores.publishCandidate(first.candidate, first.at);
+      await waitForLockWaiters(2);
+      await blocker.query('commit');
+      await newer;
+      expect(await publication).toBe(false);
+      expect(await first.scores.get(first.id, first.scoreId)).toMatchObject({ value: 20 });
+      expect(await first.tasks.getTask(first.task.id)).toMatchObject({ state: 'running' });
+    } finally { await blocker.query('rollback'); blocker.release(); }
+
+    const second = await directCandidateFixture();
+    const scoreBlocker = await database.pool.connect();
+    try {
+      await scoreBlocker.query('begin');
+      await scoreBlocker.query('select article_id from article_scores where article_id=$1 and score_id=$2 for update', [second.id, second.scoreId]);
+      const publication = second.scores.publishCandidate(second.candidate, second.at);
+      await waitForLockWaiters(1);
+      const newer = second.tasks.createTask({ articleId: second.id, action: 'scores', scoreTargetId: second.scoreId, generation: 2, createdAt: second.at, updatedAt: second.at });
+      await waitForLockWaiters(2);
+      await scoreBlocker.query('commit');
+      expect(await publication).toBe(true);
+      await newer;
+      expect(await second.scores.get(second.id, second.scoreId)).toMatchObject({ value: 75 });
+      expect(await second.tasks.getTask(second.task.id)).toMatchObject({ state: 'succeeded' });
+    } finally { await scoreBlocker.query('rollback'); scoreBlocker.release(); }
+  }, 15000);
+
+  it('serializes target deactivation before publication', async () => {
+    const f = await directCandidateFixture();
+    const client = await database.pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('update score_definitions set active=false where id=$1', [f.scoreId]);
+      const publication = f.scores.publishCandidate(f.candidate, f.at);
+      await waitForLockWaiters(1);
+      await client.query('commit');
+      expect(await publication).toBe(false);
+      expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 20 });
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
+    } finally { await client.query('rollback'); client.release(); }
+  }, 15000);
+
+  it('serializes epoch changes before publication', async () => {
+    const f = await directCandidateFixture();
+    const client = await database.pool.connect();
+    try {
+      await client.query('begin');
+      await client.query('update catalog_epoch set revision=revision+1 where id=1');
+      const publication = f.scores.publishCandidate(f.candidate, f.at);
+      await waitForLockWaiters(1);
+      await client.query('commit');
+      expect(await publication).toBe(false);
+      expect(await f.scores.get(f.id, f.scoreId)).toMatchObject({ value: 20 });
+      expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
+    } finally { await client.query('rollback'); client.release(); }
+  }, 15000);
 });

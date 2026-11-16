@@ -3,9 +3,10 @@
 ## Overview
 
 - **Outcome:** Replace the oversized admission/settlement/recovery/migration work unit with small, sequential, independently checked packages, then complete C11's request boundaries.
-- **Status:** Proposed decomposition of approved behavior; **not implementation approval**. Recommend P1 first, only after coordinator approval.
-- **Safety boundary:** P1–P5 persist and fence reservations; P6 supplies the application gate. None enables production model dispatch.
-  - P7–P11 add Pi integration and accounting proofs behind that gate. Existing article/import jobs and HTTP actions stay unwired to AI.
+- **Status snapshot (2026-11-02):** P1–P6 admission foundation, P7 private runtime, and P8 direct classifier/generation adapters are implemented locally. P8's one-send loopback proof and scoped independent review passed; see `docs/verification.md`. P9–P11 remain incomplete. This is not C11/NR-V11 completion, product acceptance, or activation approval.
+- **Approved choice:** Built-in-only Pi runtime (`modelsPath:null`); private auth persists, but custom provider/model catalogs and endpoint configuration do not. C7 defines the restricted runtime/route contract.
+- **Safety boundary:** P1–P6 persist and fence reservations; P7/P8 expose tested adapters only. Existing article/import jobs and HTTP actions stay unwired to AI; no production dispatch is enabled.
+  - P9–P11 (SDK sessions/compaction, setup/lifecycle composition, and cross-path accounting proof) remain outstanding. Live OAuth/provider evidence is also outstanding.
 - **Key decision:** Count `reserved` ledger rows as active local slots; serialize every transition through the bucket's existing `budget_settings` row.
   - No second active-slot counter to drift; concurrency spans all dates within that bucket.
 - **Key decision:** One dedicated PostgreSQL session per attempt; that session performs admission and settlement. Recovery identifies a dead database backend, not an expired wall-clock lease.
@@ -26,10 +27,10 @@ Local C/V IDs below belong to this document. `NR-C11`, `NR-V11` and `NR-V15` ref
 | C4 | `src/server/adapters/postgres/usage-admission-store.ts` (extend); `tests/integration/usage-settlement.test.ts` (new) | Add owner-fenced, terminal-once settlement without refunds or replacement results. |
 | C5 | `src/server/adapters/postgres/usage-admission-store.ts` (extend); `tests/integration/usage-recovery.test.ts` (new) | Recover only dead owners; preserve credit/history; reject late settlement. |
 | C6 | `src/server/application/usage.ts`, `tests/unit/usage.test.ts`, `tests/integration/usage-gate.test.ts` (new) | Supply the single-attempt application gate, shared auth pause and cancellation/failure cleanup, using test callbacks only. |
-| C7 | `src/server/ports/ai.ts`, `src/server/adapters/pi/runtime.ts`, `tests/unit/pi-runtime.test.ts` (new) | Define domain-facing AI boundary and one shared no-discovery runtime factory; no dispatch implementation yet. |
-| C8 | `src/server/adapters/pi/requests.ts`, `tests/helpers/fake-provider.ts`, `tests/unit/pi-requests.test.ts`, `tests/integration/pi-requests.test.ts` (new) | Route direct generation/classification through C6; verify real loopback HTTP attempts, not adapter-call counts. |
+| C7 | `src/server/ports/ai.ts`, `src/server/adapters/pi/runtime.ts`, `tests/unit/pi-runtime.test.ts` (new) | Define domain-facing AI boundary and one private shared built-in-only runtime with fixed audited routes; no persisted provider/model catalog or endpoint configuration, no dispatch implementation yet. |
+| C8 | `src/server/adapters/pi/requests.ts`, `tests/helpers/fake-provider.ts`, `tests/unit/pi-requests.test.ts`, `tests/integration/pi-requests.test.ts` (new) | Bind direct generation/classification through C6 to a one-send inference transport; prove loopback 421/redirect/retry/denial/stream and wire-ledger boundaries. Incomplete. |
 | C9 | `src/server/adapters/pi/sessions.ts`, `tests/integration/pi-sessions.test.ts` (new); `src/server/adapters/pi/resource-loader.ts`, `tests/unit/pi-resource-loader.test.ts` (extend only as needed) | Restrict sessions and wrap every SDK stream invocation, including explicit compaction and fixture resume. |
-| C10 | `src/server/adapters/pi/setup-ai.ts`, `tests/unit/setup-ai.test.ts`, `tests/unit/ai-lifecycle.test.ts` (new); `src/server/{main,config,composition-root}.ts`, `tests/unit/config.test.ts`, `compose.yaml`, `.env.example`, `README.md`, `docs/operations.md` (modify) | Add terminal-only setup, persistent private paths and shutdown/recovery composition; no AI job/route activation. |
+| C10 | `src/server/adapters/pi/setup-ai.ts`, `tests/unit/setup-ai.test.ts`, `tests/unit/ai-lifecycle.test.ts` (new); `src/server/{main,config,composition-root}.ts`, `tests/unit/config.test.ts`, `compose.yaml`, `.env.example`, `README.md`, `docs/operations.md` (modify) | Add terminal-only built-in model selection, persistent private auth and shutdown/recovery composition; no custom catalog/endpoint setup or AI job/route activation. |
 | C11 | `tests/integration/budgets.test.ts`, `tests/live/pi.live.test.ts` (new); `docs/verification.md` (extend per completed package) | Close the C11 cross-path wire-accounting matrix; record partial versus full inherited gates accurately. |
 
 ## Implementation details
@@ -37,13 +38,14 @@ Local C/V IDs below belong to this document. `NR-C11`, `NR-V11` and `NR-V15` ref
 ### Basis
 
 - **Authority:** `.ai/news-reader-plan.md`, C1 dependency exception, C10–C11, C16, V11/V15 and delivery activation rules; `docs/dev-agentic-news-reader-spec.md`, AC19–AC21; `docs/architecture.md`, sections 5–8 and 12.
+  - **Approved amendment:** The user's explicit built-in-only choice supersedes the parent NR-C11 persisted `models.json`/`catalog.json` and custom endpoint assumptions for local C7/C10. No persisted custom provider/model catalog or endpoint configuration; database role mappings remain built-in model selectors. Only this plan records the amendment; other scope and source documents are unchanged.
 - **Diagnosis / supplied state:** The prior worker could not finish the combined durable admission/settlement/recovery plus migration package. Its transient TDD attempt was discarded. The request supplies **no surviving source changes**; do not recover temporary patches or treat that attempt as test evidence.
 - **Verified working-tree facts:**
   - `UsageStore` exposes `record`, `updateEntry`, `incrementCounter`, budget CRUD and reads; its comment explicitly excludes admission. Source search found no production callers of those usage writers.
   - `usage_ledger` currently permits only `reserved|succeeded|failed`; it has no owner, settlement timestamp or cost/provenance fields.
   - `request_counters` has primary key `(day_utc,bucket)`. `budget_settings` already contains all four buckets and approved defaults from `drizzle/0002_budget_settings.sql`.
   - `src/shared/settings.ts` already validates nullable limits and permits zero. Reuse it; no default/validation redesign.
-  - `src/server/adapters/pi/resource-loader.ts:createEmptyResourceLoader` and its unit test exist. `AiPort`, application admission, runtime, requests and session adapters do not.
+  - At initial planning, `src/server/adapters/pi/resource-loader.ts:createEmptyResourceLoader` and its unit test existed; `AiPort`, admission and other Pi adapters did not. This is historical inventory, not current status: `docs/verification.md` records later partial C7/C8 work; C8 below retains the uncompleted transport/evidence gate.
   - `runImport` in `src/server/adapters/postgres/import-jobs.ts` demonstrates dedicated-client error handling, heartbeat and same-session fenced writes. Do not reuse its import lock or processing ownership token for usage.
   - `migrateDatabase` uses explicit administrative migrations with an advisory lock. Normal startup must remain DDL-free.
   - Latest migration is `0004_feedback`; readiness in `src/server/http/app.ts` pins journal timestamp `1793526239814`. The parent plan's original empty-repository inventory is historical, not current reality.
@@ -92,9 +94,9 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 - **A4 — Settlement:** Only the originating live owner can transition its reserved row once; usage validation and terminal immutability hold; counters never decrease.
 - **A5 — Recovery:** Live owners survive sweeps; dead owners become uncertain once; stale settlement cannot overwrite recovery; repeated/concurrent sweeps preserve history/counters.
 - **A6 — Gate:** Preflight denial/cancellation causes zero reservation/dispatch; post-commit failure follows D2/D6. Every invoked attempt has a committed reservation; auth failure prevents repeated later calls for the affected model configuration across roles.
-- **A7 — Direct Pi:** Shared runtime, explicit physical model/capability validation, no hidden retries/discovery/fallback; validated bool/choice/score and text outcomes; honest nullable usage.
+- **A7 — Direct Pi:** Shared built-in-only runtime and fixed audited routes per C7, explicit physical model/capability validation, no hidden retries/discovery/fallback; validated bool/choice/score and text outcomes; honest nullable usage.
 - **A8 — SDK:** Exact custom tool allowlist and resource isolation on create/resume; one admission per underlying stream invocation, including multi-tool continuation and explicit compaction; all terminal/abort paths settle or recover safely.
-- **A9 — Operations:** Terminal-only setup and private persistent auth; no credential logging/UI; missing auth does not block reader/import; shutdown closes owners before pools; no startup DDL or automatic model dispatch.
+- **A9 — Operations:** Terminal-only built-in model selection and private persistent auth; no credential logging/UI; missing auth does not block reader/import; shutdown closes owners before pools; no startup DDL or automatic model dispatch.
 - **A10 — Accounting evidence:** Loopback HTTP counters prove no unadmitted request and zero extra traffic on denial. Wire attempts equal dispatched reservations, **not all committed credits**: cancellation/crash between commit and send legitimately consumes credit with no wire request.
 - **A11 — Status:** Package evidence names scope and unavailable checks. Foundation success is not NR-V11, C11, D2, live/provider or production acceptance.
 
@@ -193,7 +195,9 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 
 ### C7 — Shared runtime and AI port, no requests
 
-- Implement a runtime factory with NR-C11's exact private `/data/pi-auth/{auth.json,models.json,catalog.json}` paths, `allowModelNetwork:false` and `refreshOnCreate:false`; use one instance per composed application. Only app/operator configuration is read. Setup may explicitly perform authorized auth/catalog operations; serve construction performs none.
+- Construct one application-owned shared runtime with `{ authPath:'/data/pi-auth/auth.json', modelsPath:null, allowModelNetwork:false, refreshOnCreate:false }`. Pi 1.4.0 selects its in-memory model store when `modelsPath:null`; do not supply `modelsStore`, `modelsStorePath` or `catalogBaseUrl`. No persisted custom provider/model catalog or endpoint configuration is read or written by serve or setup; pre-existing `models.json`/`catalog.json` are ignored, not migrated/deleted.
+- Keep the mutable runtime, providers and model objects private behind the application boundary. Accept only a fixed, code-owned audited built-in provider/API/transport/endpoint route allowlist; a catalog model/API string alone does not prove implementation identity. No caller-supplied runtime/provider injection, endpoint overrides, ambient extensions or model/provider overlays; role mappings select eligible built-in physical models without defining routes.
+- Preserve private credential storage and Pi auth resolution/ordinary OAuth refresh. Login and token refresh are auth traffic **outside inference accounting**: no inference credit/ledger row or inference dispatch permit is consumed by auth traffic, and auth must not dispatch a model completion. Serve construction performs no auth/network operation; setup may perform authorized login, not custom catalog/endpoint configuration.
 - Define `AiPort.classify(request,scope)`, `generate(request,scope)`, `createRestrictedSession(options,scope)` returning application-owned values/handles, never SDK instances.
   - Classification request: model reference, role, JSON object state and keyed questions. Mirror Pi's bool/choice/score question structures as application types; no SDK imports in the port. Validate answer key/type matches, choice membership and finite probabilities/confidence 0–1 before success.
   - Score questions require at least two ordered criteria. Pi returns an expected level index in `0..criteria.length-1` (pinned `docs/codemode.md`); validate that native range and preserve the scale in the domain result. Do not mislabel a raw index as an article's 0–100 score. Conversion/persistence belongs to the later scoring caller, outside C11.
@@ -205,11 +209,14 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 
 ### C8 — Direct Pi requests
 
-- Implement the direct methods using the shared runtime, C6 and explicit provider `maxRetries:0`; never call unrelated clients with extracted OAuth tokens.
+- **Status:** Direct classification and generation are implemented in `src/server/adapters/pi/classifier.ts`, `generator.ts`, `single-send-transport.ts` and `runtime.ts`, using the C6 admission gate. Focused loopback/usage tests and independent scoped review passed; see `docs/verification.md` for exact counts and limits. OAuth auth failures are sanitized and pause the physical model; successful OAuth refresh remains Pi-owned. API-key requests retain the 4096 output bound, but OAuth requests omit it and have no proven hard cap. P8's direct-adapter slice is complete locally; parent V11, V15, workflow wiring and activation remain incomplete. Passing existing suites does not close this gate.
+- Implement the direct methods using C7's private shared runtime/audited built-in routes, C6 and explicit provider `maxRetries:0`; never call unrelated clients with extracted OAuth tokens.
+- Bind the post-commit single-use dispatch permit to an app-owned **one-send inference transport**. Prevent HTTP 421 replay, redirect following and SDK/HTTP-layer retries or second dispatch under the same reservation; `maxRetries:0` alone is insufficient. Reject routes/transports without that guarantee before reservation. No inference activation until V8's transport proof exists; C9 must retain the same boundary.
 - Inspect resolved `stopReason` and error fields as well as rejected promises. Normalize terminal outcome before C4; malformed answers fail the attempt without publishing partial success. Missing usage remains unknown.
 - Each explicit caller retry, fallback, chunk or reduction is a new `executeAttempt` with a new owner/reservation. No loops/implicit fallback inside a single adapter invocation; validate any explicitly selected alternate model independently.
 - Add loopback fake-provider HTTP fixtures for the pinned TypeSafe System One and chosen generative HTTP/SSE protocol. Count accepted HTTP requests below Pi, with barriers to inspect the committed ledger **before** a response is released.
-  - Use fixture credentials and explicit loopback model configurations; no real provider/network catalog traffic. A mock runtime alone is insufficient evidence for this package.
+  - Use fixture credentials and test-only transport interception of the audited built-in routes to loopback, not persisted/custom provider/model/endpoint configuration. No real provider/network catalog traffic; the fixture seam must not expose runtime mutation or production endpoint configuration. A mock runtime alone is insufficient evidence.
+  - Required negative/boundary cases and wire-ledger assertions are centralized in V7–V8 below. Count auth refresh separately under C7's auth boundary; preserving OAuth refresh is not permission for an unadmitted inference request.
 - **References:** A7/A10; V8.
 
 ### C9 — Restricted SDK stream boundary
@@ -230,12 +237,12 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 
 - Extend current `main.ts` command parser to accept `setup-ai` as an administrative terminal flow, separate from `serve` and `migrate`; do not create the reader app or start workers to log in.
 - Use `runtime.login(providerId,authType,interaction)`. Show browser URL/code only in that setup terminal; support pasted redirect/code fallback according to the provider's actual methods. Do not promise a device-code flow without SDK support.
-- List available generative models and require explicit validated model selection; preserve existing mappings/user edits and `typesafe/jev-latest`. No guessed Codex ID or default fallback. Cancelled/failed setup does not overwrite a working mapping.
+- List only built-in generative models eligible under C7's fixed audited route allowlist and require explicit validated selection; persist role mappings, not provider/model catalogs or endpoints. Preserve existing mappings/user edits and `typesafe/jev-latest`; out-of-allowlist mappings stay stored but report paused configuration, with no automatic substitution. No guessed Codex ID or default fallback. Cancelled/failed setup does not overwrite a working mapping.
 - Keep config validation command-appropriate: setup must not require a running HTTP server/FreshRSS; database access is needed only to persist selected role mappings. Missing writable private paths is a setup diagnostic, not leaked credentials.
 - In composition, use a separate usage-owner pool so held provider ownership clients cannot exhaust the reader/import pool. Pool backpressure is a resource constraint, not an invented budget cap when concurrency is null.
   - Run recovery before exposing the internal AI boundary; do not call any model at startup. Missing credentials leave the boundary paused, not reader readiness failed.
   - On shutdown stop new admissions, abort active attempts, perform bounded healthy-session cleanup, destroy unresolved owners, then close owner pool and existing application resources. Failed cleanup remains recoverable.
-- Update compose/env/operations for private writable Pi directory ownership, `TYPESAFE_API_KEY`/secret handling, interactive container command, external re-login restart requirement and backup inclusion. Existing `/data` mount already persists auth; no personal Pi mount/new callback service.
+- Update compose/env/operations for private writable `/data/pi-auth/auth.json` ownership, `TYPESAFE_API_KEY`/secret handling, interactive container command, external re-login restart requirement and auth backup inclusion. Existing `/data` mount already persists auth; no personal Pi mount/new callback service, persisted catalog or custom endpoint settings. Ordinary OAuth refresh remains supported under C7's auth boundary.
 - The HTTP/job graph remains AI-inactive. This package composes a capability, not automatic enrichment or an activation flag that bypasses NR gates.
 - **References:** A9; V10.
 
@@ -250,7 +257,7 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 ## Verification
 
 - **Strategy:** PostgreSQL tests prove locking, rollback, migration and backend death; application tests prove call sequencing; actual loopback provider HTTP/SSE proves Pi cannot hide attempts. No live call needed for foundation.
-- **Planning status:** All checks below are **proposed, not run**. No Bash, process execution, provider request or database mutation was used to write this plan.
+- **Current verification status:** The historical planning-only statement is superseded. Local checks have now run for P1–P8 slices; see `docs/verification.md` for commands, runtimes, counts, reviews and limitations. P9–P11 and parent V11/V15 remain incomplete, and no V gate or C11 acceptance is declared complete here. No live provider request or production activation was performed.
 - **Prerequisites:** Node 24.21.0 with current lockfile installation; Docker daemon and locally cached `postgres:18` image for new integration suites. Follow `tests/integration/enrichment.test.ts`'s `--pull=never`, random container name, loopback ephemeral port, disposable `feedrafter_test`, bounded readiness and unconditional cleanup.
   - `tests/helpers/usage-database.ts` is a narrow shared version of that fixture for these suites; no external `DATABASE_URL` accepted, no implicit image pull and no skipped acceptance on missing Docker.
   - Exact focused commands use the Vitest executable: existing `test:integration` script already includes both test directories, so appending a file to that script is not a reliable exclusive file filter.
@@ -263,8 +270,8 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 | V4 | C4 / A4 | `npm exec -- vitest run tests/integration/usage-settlement.test.ts` | One terminal transition; no stale writer/refund/partial usage write. |
 | V5 | C5 / A5 | `npm exec -- vitest run tests/integration/usage-recovery.test.ts` | Only dead backend reservations become uncertain; races preserve counters/history. |
 | V6 | C6 / A6 | `npm exec -- vitest run tests/unit/usage.test.ts tests/integration/usage-gate.test.ts` | Callback ordering/count and cleanup states match every boundary below. |
-| V7 | C7 / A7 | `npm exec -- vitest run tests/unit/pi-runtime.test.ts` | One injected shared runtime, exact paths, no discovery/network and preflight failures. |
-| V8 | C8 / A7,A10 | `npm exec -- vitest run tests/unit/pi-requests.test.ts tests/integration/pi-requests.test.ts` | Committed reservation precedes each wire request; classifier/generation do not retry internally. |
+| V7 | C7 / A7 | `npm exec -- vitest run tests/unit/pi-runtime.test.ts` | One private shared built-in-only runtime, private auth/in-memory catalog, no overlays/endpoint configuration/discovery/network and preflight failures. |
+| V8 | C8 / A7,A10 | `npm exec -- vitest run tests/unit/pi-requests.test.ts tests/integration/pi-requests.test.ts` | One-send 421/redirect/retry/denial/stream matrix and wire-ledger correlation below pass; no unadmitted or repeated inference send. |
 | V9 | C9 / A8,A10 | `npm exec -- vitest run tests/unit/pi-resource-loader.test.ts tests/integration/pi-sessions.test.ts` | Exact tools/resources, admitted multi-turn/compaction/resume and stream cleanup pass. |
 | V10 | C10 / A9 | `npm exec -- vitest run tests/unit/setup-ai.test.ts tests/unit/ai-lifecycle.test.ts tests/unit/config.test.ts` | Terminal isolation, no-secret logs, authless startup and shutdown/recovery composition pass. |
 | V11 | All / A10–A11 | `npm exec -- vitest run tests/integration/budgets.test.ts`; then `npm run test:unit`, `npm run test:integration`, `npm run typecheck`, `npm run lint`, `npm run build`, `npm exec -- drizzle-kit check` | Package and regression checks pass; evidence explicitly retains inherited open gates. |
@@ -303,9 +310,12 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
   - Success resolves only after settlement; settlement error never invokes provider twice or publishes an accounted success. Owner death ignores late callback success and sweeps uncertain.
   - One auth failure pauses the same provider/model in other roles, with no subsequent reservations/traffic; unrelated model remains eligible. Explicit repair/restart recovery only, not day rollover.
 - **V7–V8:**
+  - V7: assert C7's exact runtime options and in-memory store; hostile/stale private or ambient `models.json`/catalog/extension overlays cannot change built-in model/provider/endpoint identity. No catalog/config file reads/writes or mutable runtime/provider/model handles exposed to callers; out-of-allowlist routes fail before reserve/send.
   - Wrong model kind, missing mapping/auth, invalid context/response keys, unconfigured fallback and unsupported virtual model fail before send; classifier bucket cannot be overridden to interactive/automatic.
   - TypeSafe bool/choice/score valid/invalid results, including native score endpoints/fractional midpoint/out-of-range indices for a known criteria count; gen text success/error/aborted stop reasons; resolved-error responses; missing tokens/catalog-zero cost remains unknown.
-  - HTTP 429/5xx, invalid JSON and response loss each generate at most one wire attempt per reservation with maxRetries zero. Later explicit fallback/retry uses another ledger row and current cap.
+  - V8: real loopback HTTP 421, redirects (including a counted destination listener), 429/5xx, invalid JSON and response loss each produce at most one inference wire request under a reservation; zero replay/redirect-destination/hidden retry traffic. A second dispatch using the same permit is rejected without wire traffic. Later explicit fallback/retry needs a new ledger row and current cap.
+  - V8: daily/concurrency/auth/preflight denial produces zero additional inference requests; held responses expose an already-committed matching reserved row before any response is released. Correlate every accepted inference request to a unique ledger row and assert terminal/counter state, not runtime-call counts; retain A10's documented counted zero-wire exceptions.
+  - V8: generation HTTP/SSE success, resolved error, abort, truncated stream, `.result()` consumption and early consumer return preserve ordered events and settle once or leave a recoverable dead owner; no stream reconnect/retry/continuation under the same permit. Exercise fixture OAuth refresh separately: credentials remain private/preserved, auth traffic consumes no inference credit/permit, and every subsequent inference send still requires its own admitted permit.
 - **V9:**
   - Hostile working-directory `.pi`/AGENTS/resources ignored; exact custom tools survive create/resume, default tools absent; disallowed tool calls cannot run.
   - User prompt → tool call → continuation uses two admissions and two HTTP requests; exhausted cap between them blocks the second request without losing the completed first ledger entry.
@@ -313,6 +323,7 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
   - Error/abort/truncated stream, `.result()` consumption, early iterator return and disposed session each terminate accounting once or produce a recoverable dead owner. Forwarded events remain ordered/unmodified.
 - **V10:**
   - Fake interactive login URL/pasted-code flow, unsupported device flow, cancellation and failed mapping update; no secret/code appears in normal server logs or returned HTTP data.
+  - Setup lists/selects only eligible built-ins and preserves role mappings/auth without creating or consuming persisted custom provider/model catalogs or endpoint settings; rejected/out-of-allowlist selections do not overwrite mappings. Private auth persistence/restart behavior remains required; refresh follows C7, not inference accounting.
   - Missing credentials leaves reader/import boot usable with zero provider calls; recovery precedes exposing internal AI service; unhealthy recovery prevents that capability but must not silently dispatch.
   - Shutdown during provider wait aborts/settles-or-destroys owners before pool close; restart sweeps unresolved reservations. Setup starts no HTTP/import worker or startup DDL.
 - **V11:**
@@ -354,9 +365,9 @@ These refine AC19–AC21 for this decomposition, not replace their broader requi
 
 ## Readiness and open decisions
 
-- **Plan readiness:** Ready for coordinator review of package boundaries; approval pending. No source implementation performed.
-- **Recommended first delivery:** P1 only. Its successful migration is not permission to start P8 or enable dispatch.
+- **Plan readiness:** Built-in-only material C7/C10 scope amendment approved by the user; no remaining decision on persisted catalog/custom endpoint support. P8's direct-adapter slice and its loopback proof are now implemented, but P9–P11, parent V11/V15 and workflow wiring remain open. Package/implementation acceptance and inference activation are not granted.
+- **Recommended next C11 package:** P9, after confirming its session boundary can reuse the proven P8 transport; then P10 and P11 in dependency order. This recommendation does not authorize inference activation or alter the broader D2 priority.
 - **Foundational policy gaps:** None identified beyond the confirmed policies recorded in D1–D6. Do not reopen them implicitly during implementation.
-- **Missing execution evidence:** Current Git status/diff baseline, current Node/Docker availability, fresh suite baseline and application-role backend visibility must be verified by an authorized executor. Not checked here because this task is file-only planning.
-- **Downstream operator decisions/evidence:** Exact generative model/role mappings and authorized isolated OAuth/provider proof remain outstanding for NR-V15; no guessed model/cost consent. They do not block foundation or fake-provider packages.
+- **Execution evidence limits:** Git status and `git diff --check` were inspected for this plan update. Node/Docker were not rerun here; use the dated evidence in `docs/verification.md` and recheck environment-specific prerequisites before the next package. Live provider/OAuth evidence and target-host gates remain outstanding.
+- **Downstream operator decisions/evidence:** Exact built-in generative model/role mappings and authorized isolated OAuth/provider proof remain outstanding for NR-V15; no guessed model/cost consent. They do not block foundation or fake-provider packages.
 - **Stop/report rule:** Any material policy gap, missing prerequisite, contradictory repository state or provider request bypass returns `needs_input` to the coordinator. No interactive prompt, replacement design, policy invention or automatic workflow advance.

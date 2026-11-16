@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
-import { boolean, check, date, doublePrecision, index, integer, jsonb, pgTable, primaryKey, text, timestamp, unique, uuid } from "drizzle-orm/pg-core";
+import { boolean, check, date, doublePrecision, index, integer, jsonb, pgTable, primaryKey, text, timestamp, unique, uniqueIndex, uuid } from "drizzle-orm/pg-core";
 import { articles } from "./import.js";
+import { processingTasks } from "./processing.js";
 
 const time = (name: string) => timestamp(name, { withTimezone: true, mode: "date" });
 
@@ -15,7 +16,13 @@ export const tags = pgTable("tags", {
   label: text().notNull(),
   key: text().notNull(),
   archivedAt: time("archived_at"),
-}, (t) => [unique("tags_key_unique").on(t.key), check("tag_key_nonempty", sql`length(${t.key}) > 0`)]);
+  manualOffset: doublePrecision("manual_offset").notNull().default(0),
+}, (t) => [unique("tags_key_unique").on(t.key), check("tag_key_nonempty", sql`length(${t.key}) > 0`), check("tag_offset_finite", sql`${t.manualOffset} > '-Infinity'::float8 and ${t.manualOffset} < 'Infinity'::float8`)]);
+
+export const catalogEpoch = pgTable("catalog_epoch", {
+  id: integer().primaryKey().default(1),
+  revision: integer().notNull().default(0),
+}, (t) => [check("catalog_epoch_singleton", sql`${t.id} = 1`), check("catalog_epoch_revision", sql`${t.revision} >= 0`)]);
 
 export const articleTags = pgTable("article_tags", {
   articleId: uuid("article_id").notNull().references(() => articles.id, { onDelete: "cascade" }),
@@ -33,6 +40,22 @@ export const articleContents = pgTable("article_contents", {
   capturedAt: time("captured_at").notNull(),
 }, (t) => [check("content_revision_positive", sql`${t.revision} > 0`)]);
 
+export const contextPlans = pgTable("context_plans", {
+  id: text().primaryKey(),
+  taskId: uuid("task_id").notNull().references(() => processingTasks.id, { onDelete: "cascade" }),
+  articleId: uuid("article_id").notNull().references(() => articles.id, { onDelete: "cascade" }),
+  contentRevision: integer("content_revision").notNull(),
+  assignmentRevision: integer("assignment_revision").notNull(),
+  generation: integer().notNull(),
+  taskKind: text("task_kind").notNull(),
+}, (t) => [check("context_plan_identity", sql`${t.id} ~ '^[0-9a-f]{64}$' and ${t.contentRevision} > 0 and ${t.assignmentRevision} >= 0 and ${t.generation} >= 0 and length(${t.taskKind}) > 0`)]);
+
+export const contextCheckpoints = pgTable("context_checkpoints", {
+  planId: text("plan_id").primaryKey().references(() => contextPlans.id, { onDelete: "cascade" }),
+  state: jsonb().notNull(),
+  updatedAt: time("updated_at").notNull(),
+}, (t) => [check("context_checkpoint_size", sql`jsonb_typeof(${t.state}) = 'object' and octet_length(${t.state}::text) <= 1048576`)]);
+
 export const contentChunks = pgTable("content_chunks", {
   id: uuid().defaultRandom().primaryKey(),
   articleId: uuid("article_id").notNull().references(() => articles.id, { onDelete: "cascade" }),
@@ -41,7 +64,18 @@ export const contentChunks = pgTable("content_chunks", {
   startOffset: integer("start_offset").notNull(),
   endOffset: integer("end_offset").notNull(),
   text: text().notNull(),
-}, (t) => [unique().on(t.articleId, t.contentRevision, t.ordinal), check("chunk_bounds", sql`${t.contentRevision} > 0 and ${t.ordinal} >= 0 and ${t.startOffset} >= 0 and ${t.endOffset} > ${t.startOffset}`)]);
+  planId: text("plan_id").references(() => contextPlans.id, { onDelete: "cascade" }),
+  plannerChunkId: text("planner_chunk_id"),
+  overlap: integer(),
+  startSeconds: doublePrecision("start_seconds"),
+  endSeconds: doublePrecision("end_seconds"),
+}, (t) => [
+  uniqueIndex("legacy_chunk_ordinal").on(t.articleId, t.contentRevision, t.ordinal).where(sql`${t.planId} is null`),
+  uniqueIndex("plan_chunk_ordinal").on(t.planId, t.ordinal).where(sql`${t.planId} is not null`),
+  uniqueIndex("plan_chunk_identity").on(t.planId, t.plannerChunkId).where(sql`${t.planId} is not null`),
+  check("chunk_plan_identity", sql`(${t.planId} is null and ${t.plannerChunkId} is null and ${t.overlap} is null and ${t.startSeconds} is null and ${t.endSeconds} is null) or (${t.planId} is not null and ${t.plannerChunkId} is not null and ${t.plannerChunkId} ~ '^[0-9a-f]{64}$' and ${t.overlap} is not null and ${t.overlap} >= 0)`),
+  check("chunk_bounds", sql`${t.contentRevision} > 0 and ${t.ordinal} >= 0 and ${t.startOffset} >= 0 and ${t.endOffset} > ${t.startOffset}`),
+]);
 
 export const chunkResults = pgTable("chunk_results", {
   id: uuid().defaultRandom().primaryKey(),

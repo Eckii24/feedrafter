@@ -101,10 +101,10 @@ describe('usage migration', () => {
     const other = await createUsageDatabase();
     try {
       await migrateDatabase(other.pool);
-      expect((await other.pool.query('select count(*)::int as n from drizzle.__drizzle_migrations')).rows[0].n).toBe(6);
+      expect((await other.pool.query('select count(*)::int as n from drizzle.__drizzle_migrations')).rows[0].n).toBe(10);
       expect((await other.pool.query("select column_name from information_schema.columns where table_name='usage_ledger' and column_name='owner_token'")).rowCount).toBe(1);
       await migrateDatabase(other.pool);
-      expect((await other.pool.query('select count(*)::int as n from drizzle.__drizzle_migrations')).rows[0].n).toBe(6);
+      expect((await other.pool.query('select count(*)::int as n from drizzle.__drizzle_migrations')).rows[0].n).toBe(10);
     } finally { await other.dispose(); }
   }, 30000);
 });

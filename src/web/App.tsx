@@ -2,7 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { HttpError, request, safeLink, type Article, type Page, type Run } from './api';
 import { FeedbackPicker } from './FeedbackPicker';
 import { CatalogSettings } from './CatalogSettings';
+import { PreferenceSettings } from './PreferenceSettings';
 import { ArticleCatalog } from './ArticleCatalog';
+import { Summary } from './Summary';
+import { ScoreReevaluation } from './ScoreReevaluation';
+import { ScoreResults } from './ScoreResults';
+import { karakeepStatus, suitableKarakeepUrl, useKarakeep } from './useKarakeep';
 
 type Filters = { read: string; kind: string; source: string; title: string; sort: string; direction: string; scoreId: string };
 type ScoreOption = { id: string; name: string; active: boolean; deletedAt: string | null };
@@ -13,6 +18,7 @@ function date(value: string | null) { return value && !Number.isNaN(Date.parse(v
 
 export default function App() {
   const [settings, setSettings] = useState(false);
+  const [preferences, setPreferences] = useState(false);
   const [scores, setScores] = useState<ScoreOption[]>([]);
   const [scoresUnavailable, setScoresUnavailable] = useState(false);
   const [draft, setDraft] = useState(defaults);
@@ -31,11 +37,13 @@ export default function App() {
   const [catalogChanges, setCatalogChanges] = useState(0);
   const [runId, setRunId] = useState<string | null>(null);
   const [run, setRun] = useState<Run | null>(null);
+  const karakeep = useKarakeep(selected, online);
   const listSequence = useRef(0);
   const scoresSequence = useRef(0);
   const detailSequence = useRef(0);
   const backRef = useRef<HTMLButtonElement>(null);
   const settingsRef = useRef<HTMLButtonElement>(null);
+  const preferencesRef = useRef<HTMLButtonElement>(null);
   const selectedRef = useRef(selected);
   selectedRef.current = selected;
   const invalidate = useCallback(() => { setCursors([]); setRefresh(n => n + 1); }, []);
@@ -56,7 +64,7 @@ export default function App() {
     return () => events.close();
   }, [invalidate]);
   useEffect(() => {
-    if (!online || settings) return;
+    if (!online || settings || preferences) return;
     let current = true;
     const seq = ++scoresSequence.current;
     request<{ items: ScoreOption[] }>('/api/v1/scores').then(result => {
@@ -69,7 +77,7 @@ export default function App() {
       setCursors([]);
     }).catch(() => { if (current && seq === scoresSequence.current) { setScores([]); setScoresUnavailable(true); } });
     return () => { current = false; };
-  }, [online, settings]);
+  }, [online, settings, preferences]);
   useEffect(() => {
     if (!online) return;
     const seq = ++listSequence.current;
@@ -150,8 +158,9 @@ export default function App() {
   }
   const link = safeLink(detail?.url ?? null);
   if (settings) return <CatalogSettings online={online} onBack={() => { setSettings(false); requestAnimationFrame(() => settingsRef.current?.focus()); }} />;
+  if (preferences) return <PreferenceSettings online={online} onBack={() => { setPreferences(false); requestAnimationFrame(() => preferencesRef.current?.focus()); }} />;
   return <>
-    <header className="top"><div><h1>Feedrafter</h1><p>Your reader</p></div><button ref={settingsRef} onClick={() => setSettings(true)}>Catalog settings</button><button disabled={!online || busy} onClick={() => void startImport()}>Import now</button></header>
+    <header className="top"><div><h1>Feedrafter</h1><p>Your reader</p></div><button ref={settingsRef} onClick={() => setSettings(true)}>Catalog settings</button><button ref={preferencesRef} onClick={() => setPreferences(true)}>Preferences</button><button disabled={!online || busy} onClick={() => void startImport()}>Import now</button></header>
     {!online && <div className="notice" role="status">Offline. Previously displayed articles remain visible; changes and imports are unavailable.</div>}
     {error && <div className="error" role="alert">{error}</div>}
     {listStatus && <div className="notice" role="status">{listStatus}</div>}
@@ -174,7 +183,7 @@ export default function App() {
         <ul className="articles">{page?.items.map(item => <li key={item.id}><button id={`article-${item.id}`} className={selected === item.id ? 'article selected' : 'article'} aria-current={selected === item.id ? 'true' : undefined} onClick={() => { setDetail(null); setSelected(item.id); }}><strong>{item.title || 'Untitled'}</strong><span>{item.kind} · {date(item.publishedAt || item.importedAt)} · {item.isRead ? 'Read' : 'Unread'}</span><small>Source: {item.sourceId || 'Unknown'}</small>{filters.sort === 'score' && <small>Score: {item.scoreValue == null ? 'Not scored' : item.scoreValue}</small>}</button></li>)}</ul>
         <nav className="pagination" aria-label="Article pages"><button disabled={!online || loading || cursors.length === 0} onClick={() => setCursors(c => c.slice(0, -1))}>Previous</button><span>Page {cursors.length + 1}</span><button disabled={!online || loading || !page?.nextCursor} onClick={() => { if (page?.nextCursor) setCursors(c => [...c, page.nextCursor!]); }}>Next</button></nav>
       </section>
-      <section className="detail" aria-label="Article detail"><button ref={backRef} className="back" onClick={() => { const previous = selected; setSelected(null); setDetail(null); requestAnimationFrame(() => document.getElementById(`article-${previous}`)?.focus()); }}>← Back to articles</button>{!selected ? <p>Select an article to read its details.</p> : !detail ? <p role="status">Loading article…</p> : <article><p className="eyebrow">{detail.kind} · {detail.isRead ? 'Read' : 'Unread'}</p><h2>{detail.title || 'Untitled'}</h2><p>{detail.author && <>{detail.author} · </>}{date(detail.publishedAt || detail.importedAt)}</p><p>Source: {detail.sourceId || 'Unknown'}</p><div className="actions"><button disabled={!online || busy} onClick={() => void changeRead()}>Mark {detail.isRead ? 'unread' : 'read'}</button>{detail.mailState === 'sent' ? <span>Mail sent</span> : <button disabled={!online || busy} onClick={() => void changeMailSelection()}>{detail.mailState === 'selected' ? 'Remove from mail queue' : 'Select for mail'}</button>}{link && <a href={link} target="_blank" rel="noopener noreferrer">Open original ↗</a>}</div><ArticleCatalog key={detail.id} articleId={detail.id} online={online} refresh={refresh} onChanged={() => setCatalogChanges(n => n + 1)} /><FeedbackPicker key={`${detail.id}:${catalogChanges}`} articleId={detail.id} online={online} /><p className="muted">Preparation unavailable. Article content is available at the original link when provided.</p></article>}</section>
+      <section className="detail" aria-label="Article detail"><button ref={backRef} className="back" onClick={() => { const previous = selected; setSelected(null); setDetail(null); requestAnimationFrame(() => document.getElementById(`article-${previous}`)?.focus()); }}>← Back to articles</button>{!selected ? <p>Select an article to read its details.</p> : !detail ? <p role="status">Loading article…</p> : <article><p className="eyebrow">{detail.kind} · {detail.isRead ? 'Read' : 'Unread'}</p><h2>{detail.title || 'Untitled'}</h2><p>{detail.author && <>{detail.author} · </>}{date(detail.publishedAt || detail.importedAt)}</p><p>Source: {detail.sourceId || 'Unknown'}</p><div className="actions"><button disabled={!online || busy} onClick={() => void changeRead()}>Mark {detail.isRead ? 'unread' : 'read'}</button>{detail.mailState === 'sent' ? <span>Mail sent</span> : <button disabled={!online || busy} onClick={() => void changeMailSelection()}>{detail.mailState === 'selected' ? 'Remove from mail queue' : 'Select for mail'}</button>}{link && <a href={link} target="_blank" rel="noopener noreferrer">Open original ↗</a>}{karakeep.available && suitableKarakeepUrl(detail.url) && !karakeep.entry?.invalid && <button disabled={!online || karakeep.submitting || !!karakeep.entry?.taskId} onClick={() => void karakeep.save(detail.id)}>Save to Karakeep</button>}</div><div className="karakeep-status" role="status" aria-live="polite">{karakeepStatus(karakeep.entry)}{karakeep.entry?.error && <span> {karakeep.entry.error}</span>}</div><ScoreResults key={detail.id} articleId={detail.id} online={online} refresh={refresh} /><ScoreReevaluation key={detail.id} articleId={detail.id} online={online} refresh={refresh} /><Summary key={detail.id} articleId={detail.id} online={online} refresh={refresh} /><ArticleCatalog key={detail.id} articleId={detail.id} online={online} refresh={refresh} onChanged={() => setCatalogChanges(n => n + 1)} /><FeedbackPicker key={`${detail.id}:${catalogChanges}`} articleId={detail.id} online={online} /><p className="muted">Preparation unavailable. Article content is available at the original link when provided.</p></article>}</section>
     </main>
   </>;
 }

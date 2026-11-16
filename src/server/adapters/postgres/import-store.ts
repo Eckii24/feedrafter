@@ -4,6 +4,7 @@ import type { Database } from "./client.js";
 import { acknowledgements, appSettings, articles, importContexts, sources } from "./schema/index.js";
 
 export type ImportTransaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
+export type ImportedArticleIdentity = { id: string; inserted: boolean };
 
 export class ImportStore {
   constructor(private readonly db: Database) {}
@@ -20,7 +21,19 @@ export class ImportStore {
   }
 
   async importPageInTransaction(tx: ImportTransaction, contextId: string, entries: readonly FreshRssEntry[], importedAt: Date) {
-    const ids: string[] = [];
+    return (await this.importPageWithIdentitiesInTransaction(tx, contextId, entries, importedAt)).map(article => article.id);
+  }
+
+  async importPageWithIdentities(contextId: string, entries: readonly FreshRssEntry[], importedAt: Date): Promise<ImportedArticleIdentity[]> {
+    return this.db.transaction((tx) => this.importPageWithIdentitiesInTransaction(tx, contextId, entries, importedAt));
+  }
+
+  // `inserted` describes this occurrence, and is durable only if the transaction commits.
+  async importPageWithIdentitiesInTransaction(tx: ImportTransaction, contextId: string, entries: readonly FreshRssEntry[], importedAt: Date): Promise<ImportedArticleIdentity[]> {
+    // Merge takes this row exclusively before locking tags or articles.
+    const epoch = await tx.execute(sql`select revision from catalog_epoch where id = 1 for share`);
+    if (!epoch.rowCount) throw new Error("Missing catalog epoch");
+    const identities: ImportedArticleIdentity[] = [];
     for (const entry of entries) {
       let sourceId: string | null = null;
       if (entry.feedId !== null) {
@@ -28,14 +41,15 @@ export class ImportStore {
           .onConflictDoUpdate({ target: [sources.contextId, sources.externalFeedId], set: { title: entry.feedTitle } }).returning();
         sourceId = source!.id;
       }
+      // PostgreSQL 18 exposes the old row for a conflict update, and NULL for an insert.
       const [article] = await tx.insert(articles).values({
         contextId, freshrssId: entry.id, sourceId, title: entry.title, url: entry.url,
         author: entry.author, publishedAt: entry.publishedAt, importedAt,
       }).onConflictDoUpdate({
         target: [articles.contextId, articles.freshrssId],
         set: { sourceId, title: entry.title, url: entry.url, author: entry.author, publishedAt: entry.publishedAt },
-      }).returning();
-      ids.push(article!.id);
+      }).returning({ id: articles.id, inserted: sql<boolean>`old.id is null` });
+      identities.push(article!);
       // An entry observed unread again needs a new confirmation; existing pending
       // intents keep their eligibility and diagnostics until reconciliation.
       await tx.insert(acknowledgements).values({ contextId, articleId: article!.id })
@@ -45,7 +59,7 @@ export class ImportStore {
           setWhere: eq(acknowledgements.status, "confirmed"),
         });
     }
-    return ids;
+    return identities;
   }
 
   async pendingAcknowledgements(contextId: string) {
@@ -72,7 +86,7 @@ export class ImportStore {
 
   async getSettings() {
     const [row] = await this.db.select().from(appSettings).where(eq(appSettings.id, 1));
-    return row ?? { id: 1, importEnabled: true, importIntervalSeconds: 14400, nextImportAt: null };
+    return row ?? { id: 1, importEnabled: true, importIntervalSeconds: 14400, nextImportAt: null, preferenceHalfLifeDays: 90 };
   }
 
   async patchSettings(patch: { importEnabled?: boolean; importIntervalSeconds?: number }, now: Date) {

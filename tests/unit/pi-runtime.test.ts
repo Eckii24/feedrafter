@@ -1,14 +1,10 @@
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import * as net from 'node:net';
-import childProcess from 'node:child_process';
-import { syncBuiltinESMExports } from 'node:module';
 import { ModelRuntime } from '@earendil-works/pi-coding-agent';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createPiRuntime, preflightConfiguredAuth, selectPhysicalModel, validateClassificationAnswers, validateClassificationRequest, validateGenerationRequest } from '../../src/server/adapters/pi/runtime.js';
+import { validateClassificationAnswers, validateClassificationRequest, validateGenerationRequest } from '../../src/server/adapters/pi/runtime.js';
+import { createPiClassifier } from '../../src/server/adapters/pi/classifier.js';
+import { createPiGenerator } from '../../src/server/adapters/pi/generator.js';
+import type { UsageService } from '../../src/server/application/usage.js';
 import type { ClassificationQuestion, ClassificationRequest } from '../../src/server/ports/ai.js';
-import type { ModelRoleSettings } from '../../src/shared/settings.js';
 
 const questions: Record<string, ClassificationQuestion> = {
   b: { type: 'bool', instructions: 'bool', criteria: { true: 'yes', false: 'no' } },
@@ -17,116 +13,50 @@ const questions: Record<string, ClassificationQuestion> = {
 };
 const request: ClassificationRequest = { model: { provider: 'p', model: 'm' }, role: 'quality', state: { text: 'hello', nested: [1, null] }, questions };
 const answers = () => ({ b: { type: 'bool', probability: 0 }, c: { type: 'choice', choice: 'a', probabilities: { a: 0.8, b: 0.2 }, confidence: 1 }, s: { type: 'score', score: 1, confidence: 0.5 } });
-const scope = (bucket: 'classifier' | 'automatic' | 'interactive') => ({ bucket, signal: new AbortController().signal });
 const ref = { provider: 'test', model: 'model' };
-const mapping: ModelRoleSettings[] = [{ role: 'quality', primary: ref, fallback: null }];
 afterEach(() => vi.restoreAllMocks());
 
-describe('shared Pi runtime', () => {
-  it('constructs one injected runtime with only the fixed offline paths/options', async () => {
-    const runtime = {} as ModelRuntime;
-    const create = vi.fn(async () => runtime);
-    expect(await createPiRuntime(create)).toBe(runtime);
+describe('shared Pi runtime boundary', () => {
+  it('constructs one private runtime and exports only admitted capabilities', async () => {
+    const classifierModel = { id: 'jev-latest', provider: 'typesafe', type: 'classifier', api: 'typesafe-system-one', baseUrl: 'https://api.typesafe.ai/v1', input: ['text'] };
+    const chatModel = { id: 'gpt-4.1-mini', provider: 'openai', api: 'openai-responses', baseUrl: 'https://api.openai.com/v1', input: ['text'] };
+    const runtime = { getAuth: vi.fn(), getError: vi.fn(), listCredentials: vi.fn(async () => []), getProviderAuthStatus: vi.fn(() => ({ configured: false })), getModelOfType: vi.fn(() => classifierModel), getPhysicalModel: vi.fn(() => chatModel) } as unknown as ModelRuntime;
+    const getAuth = runtime.getAuth;
+    const create = vi.spyOn(ModelRuntime, 'create').mockResolvedValue(runtime);
+    const usage = { executeAttempt: vi.fn(async () => ({ kind: 'paused_budget', reason: 'daily_limit' })) } as unknown as UsageService;
+    const c = { provider: 'typesafe', model: 'jev-latest' }; const g = { provider: 'openai', model: 'gpt-4.1-mini' };
+    const [classifier, generator] = await Promise.all([createPiClassifier(usage, [{ role: 'quality', primary: c, fallback: null }]), createPiGenerator(usage, [{ role: 'summary', primary: g, fallback: null }])]);
+    expect(Object.keys(classifier)).toEqual(['classify']);
+    expect(Object.keys(generator)).toEqual(['generate']);
     expect(create).toHaveBeenCalledOnce();
-    expect(create).toHaveBeenCalledWith({ authPath: '/data/pi-auth/auth.json', modelsPath: '/data/pi-auth/models.json', modelsStorePath: '/data/pi-auth/catalog.json', allowModelNetwork: false, refreshOnCreate: false });
-  });
-
-  it('constructs the real pinned runtime and performs capability lookups without network or personal discovery', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'feedrafter-pi-'));
-    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(() => { throw new Error('network forbidden'); });
-    const connect = vi.spyOn(net.Socket.prototype, 'connect').mockImplementation(() => { throw new Error('network forbidden'); });
-    const refresh = vi.spyOn(ModelRuntime.prototype, 'refresh').mockResolvedValue({ aborted: false, errors: new Map() });
-    const classify = vi.spyOn(ModelRuntime.prototype, 'classify');
-    const stream = vi.spyOn(ModelRuntime.prototype, 'stream');
+    expect(create).toHaveBeenCalledWith({ authPath: '/data/pi-auth/auth.json', modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
+    const boundary = await import('../../src/server/adapters/pi/runtime.js');
+    expect(boundary).not.toHaveProperty('createPiRuntime');
+    expect(boundary).not.toHaveProperty('selectPhysicalModel');
+    expect(boundary).not.toHaveProperty('preflightConfiguredAuth');
+    expect(boundary).not.toHaveProperty('getAuth');
+    const classifierScope = { bucket: 'classifier' as const, signal: new AbortController().signal };
+    const generationScope = { bucket: 'automatic' as const, signal: new AbortController().signal };
+    const original = process.env.TYPESAFE_API_KEY; delete process.env.TYPESAFE_API_KEY;
     try {
-      const runtime = await createPiRuntime((options) => ModelRuntime.create({ ...options, authPath: join(dir, 'auth.json'), modelsPath: join(dir, 'models.json'), modelsStorePath: join(dir, 'catalog.json') }));
-      const classifier = runtime.getModelsOfType('classifier')[0];
-      const chat = runtime.getModelsOfType('chat')[0];
-      expect(classifier).toBeDefined(); expect(chat).toBeDefined();
-      if (!classifier || !chat) throw new Error('missing built-in catalog');
-      const c = { provider: classifier.provider, model: classifier.id };
-      const g = { provider: chat.provider, model: chat.id };
-      expect(selectPhysicalModel(runtime, [{ role: 'quality', primary: c, fallback: null }], c, 'quality', scope('classifier'), 'classifier').intent.bucket).toBe('classifier');
-      expect(selectPhysicalModel(runtime, [{ role: 'summary', primary: g, fallback: null }], g, 'summary', scope('interactive'), 'generation').intent.bucket).toBe('interactive');
-      expect(refresh).not.toHaveBeenCalled();
-      const route = vi.fn(() => ({ model: chat, thinkingLevel: 'off' as const }));
-      runtime.registerVirtualModel({ provider: 'test-virtual', id: 'route', name: 'route', route });
-      const virtual = { provider: 'test-virtual', model: 'route' };
-      expect(runtime.getModel(virtual.provider, virtual.model)).toBeDefined();
-      expect(() => selectPhysicalModel(runtime, [{ role: 'summary', primary: virtual, fallback: null }], virtual, 'summary', scope('automatic'), 'generation')).toThrow();
-      expect(route).not.toHaveBeenCalled(); expect(refresh).toHaveBeenCalledOnce();
-      const image = runtime.getModelsOfType('image').find((item) => !runtime.getPhysicalModel(item.provider, item.id));
-      expect(image).toBeDefined();
-      if (!image) throw new Error('missing image-only model');
-      const imageRef = { provider: image.provider, model: image.id };
-      expect(() => selectPhysicalModel(runtime, [{ role: 'summary', primary: imageRef, fallback: null }], imageRef, 'summary', scope('automatic'), 'generation')).toThrow();
-      expect(await runtime.listCredentials()).toEqual([]);
-      expect(await preflightConfiguredAuth(runtime, 'unconfigured-test-provider')).toBe('paused_auth');
-      expect(fetch).not.toHaveBeenCalled(); expect(connect).not.toHaveBeenCalled();
-      expect(classify).not.toHaveBeenCalled(); expect(stream).not.toHaveBeenCalled();
-    } finally { await rm(dir, { recursive: true, force: true }); }
-  });
-
-  it('recognizes only nonblank TypeSafe environment presence without network, commands or auth resolution', async () => {
-    const dir = await mkdtemp(join(tmpdir(), 'feedrafter-pi-auth-'));
-    const oldKey = process.env.TYPESAFE_API_KEY;
-    const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(() => { throw new Error('network forbidden'); });
-    const connect = vi.spyOn(net.Socket.prototype, 'connect').mockImplementation(() => { throw new Error('network forbidden'); });
-    const commands = (['exec', 'execSync', 'execFile', 'execFileSync', 'spawn', 'spawnSync', 'fork'] as const)
-      .map((name) => vi.spyOn(childProcess, name).mockImplementation(() => { throw new Error('commands forbidden'); }));
-    syncBuiltinESMExports();
-    const checkAuth = vi.spyOn(ModelRuntime.prototype, 'checkAuth').mockImplementation(() => { throw new Error('auth check forbidden'); });
-    const getAuth = vi.spyOn(ModelRuntime.prototype, 'getAuth').mockImplementation(() => { throw new Error('auth resolution forbidden'); });
-    const refresh = vi.spyOn(ModelRuntime.prototype, 'refresh').mockImplementation(() => { throw new Error('refresh forbidden'); });
-    try {
-      delete process.env.TYPESAFE_API_KEY;
-      const runtime = await ModelRuntime.create({ authPath: join(dir, 'auth.json'), modelsPath: join(dir, 'models.json'), modelsStorePath: join(dir, 'catalog.json'), allowModelNetwork: false, refreshOnCreate: false });
-      expect(await preflightConfiguredAuth(runtime, 'typesafe')).toBe('paused_auth');
-      process.env.TYPESAFE_API_KEY = '  \t';
-      expect(await preflightConfiguredAuth(runtime, 'typesafe')).toBe('paused_auth');
+      expect(await classifier.classify({ ...request, model: c }, classifierScope)).toEqual({ kind: 'paused_auth' });
+      process.env.TYPESAFE_API_KEY = ' \t';
+      expect(await classifier.classify({ ...request, model: c }, classifierScope)).toEqual({ kind: 'paused_auth' });
       process.env.TYPESAFE_API_KEY = 'fixture-only-key';
-      expect(await preflightConfiguredAuth(runtime, 'typesafe')).toBe('configured');
-      expect(await preflightConfiguredAuth(runtime, 'other-provider')).toBe('paused_auth');
-      expect(fetch).not.toHaveBeenCalled(); expect(connect).not.toHaveBeenCalled();
-      expect(checkAuth).not.toHaveBeenCalled(); expect(getAuth).not.toHaveBeenCalled(); expect(refresh).not.toHaveBeenCalled();
-      for (const command of commands) expect(command).not.toHaveBeenCalled();
-    } finally {
-      if (oldKey === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = oldKey;
-      for (const command of commands) command.mockRestore();
-      syncBuiltinESMExports();
-      await rm(dir, { recursive: true, force: true });
-    }
-  });
-
-  it('reports offline auth presence without resolving credentials', async () => {
-    const runtime = { getError: vi.fn(), listCredentials: vi.fn(async () => [{ providerId: 'p', type: 'oauth' }]), getProviderAuthStatus: vi.fn(() => ({ configured: false })) } as unknown as ModelRuntime;
-    expect(await preflightConfiguredAuth(runtime, 'p')).toBe('configured');
-    expect(await preflightConfiguredAuth(runtime, 'missing')).toBe('paused_auth');
-    vi.mocked(runtime.getProviderAuthStatus).mockReturnValueOnce({ configured: true, source: 'models_json_key' });
-    expect(await preflightConfiguredAuth(runtime, 'configured')).toBe('configured');
-    vi.mocked(runtime.listCredentials).mockRejectedValueOnce(new Error('secret'));
-    expect(await preflightConfiguredAuth(runtime, 'p')).toBe('paused_configuration');
-  });
-
-  it('rejects wrong kind, unmapped/fallback, transcription and overridden buckets before admission', () => {
-    const classifier = { id: 'model', provider: 'test', type: 'classifier', input: ['text'] };
-    const chat = { id: 'model', provider: 'test', input: ['text'] };
-    const runtime = { getModelOfType: vi.fn(() => classifier), getPhysicalModel: vi.fn(() => chat) } as unknown as ModelRuntime;
-    expect(selectPhysicalModel(runtime, mapping, ref, 'quality', scope('classifier'), 'classifier').intent).toEqual({ ...ref, role: 'quality', bucket: 'classifier' });
-    const fallback = { provider: 'test', model: 'fallback' };
-    vi.mocked(runtime.getModelOfType).mockReturnValueOnce({ ...classifier, id: 'fallback' } as never);
-    expect(selectPhysicalModel(runtime, [{ role: 'quality', primary: ref, fallback }], fallback, 'quality', scope('classifier'), 'classifier').intent.model).toBe('fallback');
-    expect(() => selectPhysicalModel(runtime, mapping, ref, 'quality', scope('automatic'), 'classifier')).toThrow();
-    expect(() => selectPhysicalModel(runtime, mapping, ref, 'quality', scope('classifier'), 'generation')).toThrow();
-    expect(() => selectPhysicalModel(runtime, mapping, { ...ref, model: 'fallback' }, 'quality', scope('classifier'), 'classifier')).toThrow();
-    expect(() => selectPhysicalModel(runtime, mapping, ref, 'transcription', scope('classifier'), 'classifier')).toThrow();
-    expect(() => selectPhysicalModel(runtime, [...mapping, ...mapping], ref, 'quality', scope('classifier'), 'classifier')).toThrow();
-    vi.mocked(runtime.getModelOfType).mockReturnValueOnce(undefined);
-    expect(() => selectPhysicalModel(runtime, mapping, ref, 'quality', scope('classifier'), 'classifier')).toThrow();
-    vi.mocked(runtime.getPhysicalModel).mockReturnValueOnce(undefined);
-    expect(() => selectPhysicalModel(runtime, mapping, ref, 'quality', scope('automatic'), 'generation')).toThrow();
-    vi.mocked(runtime.getPhysicalModel).mockReturnValueOnce({ ...chat, input: ['image'] } as never);
-    expect(() => selectPhysicalModel(runtime, mapping, ref, 'quality', scope('automatic'), 'generation')).toThrow();
+      expect(await classifier.classify({ ...request, model: c }, classifierScope)).toEqual({ kind: 'paused_budget', reason: 'daily_limit' });
+      const fallback = await createPiClassifier(usage, [{ role: 'quality', primary: { ...c, model: 'other' }, fallback: c }]);
+      expect(await fallback.classify({ ...request, model: c }, classifierScope)).toEqual({ kind: 'paused_budget', reason: 'daily_limit' });
+      const duplicate = await createPiClassifier(usage, [{ role: 'quality', primary: c, fallback: null }, { role: 'quality', primary: c, fallback: null }]);
+      await expect(duplicate.classify({ ...request, model: c }, classifierScope)).rejects.toThrow();
+      await expect(classifier.classify({ ...request, model: { ...c, model: 'unmapped' } }, classifierScope)).rejects.toThrow();
+      await expect(classifier.classify({ ...request, model: c, role: 'transcription' }, classifierScope)).rejects.toThrow();
+      await expect(classifier.classify({ ...request, model: c }, generationScope)).rejects.toThrow();
+      vi.mocked(runtime.getPhysicalModel).mockReturnValueOnce(undefined);
+      await expect(generator.generate({ model: g, role: 'summary', system: '', user: '' }, generationScope)).rejects.toThrow();
+      vi.mocked(runtime.getPhysicalModel).mockReturnValueOnce({ ...chatModel, input: ['image'] } as never);
+      await expect(generator.generate({ model: g, role: 'summary', system: '', user: '' }, generationScope)).rejects.toThrow();
+      expect(getAuth).not.toHaveBeenCalled(); expect(usage.executeAttempt).toHaveBeenCalledTimes(2);
+    } finally { if (original === undefined) delete process.env.TYPESAFE_API_KEY; else process.env.TYPESAFE_API_KEY = original; }
   });
 });
 

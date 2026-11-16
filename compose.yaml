@@ -8,6 +8,10 @@ services:
       APP_ORIGIN: ${APP_ORIGIN:?Set the exact external browser origin}
       HOST: 0.0.0.0
       PORT: "3000"
+      # Disabled until the deployed Karakeep response contract is independently verified.
+      KARAKEEP_ENABLED: ${KARAKEEP_ENABLED:-false}
+      KARAKEEP_BASE_URL: ${KARAKEEP_BASE_URL:-}
+      KARAKEEP_TOKEN_FILE: ${KARAKEEP_TOKEN_FILE:-/data/karakeep-token}
     ports:
       - "127.0.0.1:3000:3000"
     read_only: true

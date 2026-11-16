@@ -70,7 +70,7 @@ it('assigns manually with revision fencing, serialized changes, archived history
     expect(after.map(result => result.rows)).toEqual(before.map(result => result.rows));
     expect((await database.pool.query('select is_read, mail_state, mail_selected_at, content_revision from articles where id = $1', [id])).rows).toEqual(beforeArticle);
     expect((await database.pool.query('select assignment_revision from article_scores where article_id = $1', [id])).rows[0].assignment_revision).toBe(0);
-    // Voting takes the article lock first and FK key-share locks on the tag; it must not deadlock with assignment.
+    // Voting and assignment guard the tag before taking the article lock.
     for (let i = 0; i < 5; i++) {
       const [assignment, vote] = await Promise.all([
         call('PUT', `${id}/tags/${tag}`),

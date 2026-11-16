@@ -87,10 +87,13 @@ describe('mail queue contract', () => {
       const unknown = randomUUID();
       const first = await ack([ids[0]!, ids[0]!.toUpperCase(), ids[3]!, unknown]);
       expect(first.json()).toEqual({ confirmed: [ids[0]], alreadyConfirmed: [], rejected: [{ id: ids[3], code: 'NOT_SELECTED' }, { id: unknown, code: 'NOT_FOUND' }] });
-      expect((await ack([ids[0]!])).json()).toEqual({ confirmed: [], alreadyConfirmed: [ids[0]], rejected: [] });
+      expect((await get('/api/v1/mail-queue?limit=100')).json().items.map((item: { id: string }) => item.id)).toEqual(ids.slice(1, 3).sort());
+      expect((await ack([ids[0]!, ids[1]!, ids[2]!, ids[3]!, unknown])).json()).toEqual({ confirmed: [ids[1], ids[2]], alreadyConfirmed: [ids[0]], rejected: [{ id: ids[3], code: 'NOT_SELECTED' }, { id: unknown, code: 'NOT_FOUND' }] });
+      expect((await ack([ids[0]!, ids[1]!, ids[2]!])).json()).toEqual({ confirmed: [], alreadyConfirmed: [ids[0], ids[1], ids[2]], rejected: [] });
+      expect((await get('/api/v1/mail-queue?limit=100')).json().items).toEqual([]);
       expect((await put(ids[0]!, false)).statusCode).toBe(409);
       expect((await put(ids[0]!, true)).json().error.code).toBe('MAIL_ALREADY_SENT');
-      expect((await get(`/api/v1/articles/${ids[1]}`)).json()).toMatchObject({ isRead: true, mailState: 'selected' });
+      expect((await get(`/api/v1/articles/${ids[1]}`)).json()).toMatchObject({ isRead: true, mailState: 'sent' });
       expect((await get(`/api/v1/articles/${ids[0]}`)).json()).toMatchObject({ isRead: false, mailState: 'sent' });
       expect((await database.pool.query('select * from freshrss_acknowledgements order by id')).rows).toEqual(acknowledgementsBefore);
       expect(fetchSpy).not.toHaveBeenCalled();
@@ -137,28 +140,41 @@ describe('mail queue contract', () => {
 
   it('serializes unselect and acknowledgement on the same article row', async () => {
     const store = new MailStore(database.pool);
-    for (const [id, winner] of [[ids[4]!, 'unselect'], [ids[5]!, 'ack']] as const) {
-      await store.select(id, true);
-      const client = await database.pool.connect();
-      try {
-        await client.query('begin');
-        await client.query('select id from articles where id = $1 for update', [id]);
-        let settled = false;
-        const first = (winner === 'unselect' ? store.select(id, false) : store.acknowledge([id])).finally(() => { settled = true; });
-        await delay(100);
-        expect(settled).toBe(false);
-        const second = winner === 'unselect' ? store.acknowledge([id]) : store.select(id, false);
-        await delay(100);
-        await client.query('commit');
-        const [firstResult, secondResult] = await Promise.all([first, second]);
-        if (winner === 'unselect') {
-          expect(firstResult).toBe('not_selected');
-          expect(secondResult).toEqual({ confirmed: [], alreadyConfirmed: [], rejected: [{ id, code: 'NOT_SELECTED' }] });
-        } else {
-          expect(firstResult).toEqual({ confirmed: [id], alreadyConfirmed: [], rejected: [] });
-          expect(secondResult).toBe('sent');
-        }
-      } finally { client.release(); }
-    }
+    const names = [`mail-race-first-${randomUUID()}`, `mail-race-second-${randomUUID()}`];
+    const pools = names.map(application_name => new pg.Pool({ connectionString: database.pool.options.connectionString, application_name, options: '-c statement_timeout=10000' }));
+    const [firstStore, secondStore] = pools.map(pool => new MailStore(pool)) as [MailStore, MailStore];
+    const waitForLock = async (name: string) => {
+      for (let i = 0; i < 200; i++) {
+        const waiting = await database.pool.query("select 1 from pg_stat_activity where application_name = $1 and wait_event_type = 'Lock'", [name]);
+        if (waiting.rowCount) return;
+        await delay(20);
+      }
+      throw new Error(`${name} did not wait for a lock`);
+    };
+    try {
+      for (const [id, winner] of [[ids[4]!, 'unselect'], [ids[5]!, 'ack']] as const) {
+        await store.select(id, true);
+        const client = await database.pool.connect();
+        try {
+          await client.query('begin');
+          await client.query('select id from articles where id = $1 for update', [id]);
+          const first = winner === 'unselect' ? firstStore.select(id, false) : firstStore.acknowledge([id]);
+          void first.catch(() => {});
+          await waitForLock(names[0]!);
+          const second = winner === 'unselect' ? secondStore.acknowledge([id]) : secondStore.select(id, false);
+          void second.catch(() => {});
+          await waitForLock(names[1]!);
+          await client.query('commit');
+          const [firstResult, secondResult] = await Promise.all([first, second]);
+          if (winner === 'unselect') {
+            expect(firstResult).toBe('not_selected');
+            expect(secondResult).toEqual({ confirmed: [], alreadyConfirmed: [], rejected: [{ id, code: 'NOT_SELECTED' }] });
+          } else {
+            expect(firstResult).toEqual({ confirmed: [id], alreadyConfirmed: [], rejected: [] });
+            expect(secondResult).toBe('sent');
+          }
+        } finally { await client.query('rollback'); client.release(); }
+      }
+    } finally { await Promise.all(pools.map(pool => pool.end())); }
   });
 });

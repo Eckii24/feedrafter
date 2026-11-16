@@ -3,6 +3,9 @@ export interface Article {
   author: string | null; publishedAt: string | null; importedAt: string;
   kind: 'article' | 'video'; isRead: boolean; mailState: 'not_selected' | 'selected' | 'sent'; scoreValue: number | null;
 }
+export type SavedSummary = { status: 'missing' } | { status: 'current' | 'limited' | 'outdated'; text: string; contentRevision: number; limitation: string | null; completedAt: string };
+export interface ScoreAdmission { taskId: string; scoreTargetId: string; generation: number; state: string }
+export interface ScoreTask { id: string; articleId: string; action: 'scores'; scoreTargetId: string | null; generation: number; state: string; errorCode: string | null; endedAt: string | null }
 export interface Page { items: Article[]; nextCursor: string | null }
 export interface Run { id: string; status: string; phase: string; fetchedCount: number; confirmedCount: number; pendingCount: number; errorCode: string | null }
 export class HttpError extends Error {

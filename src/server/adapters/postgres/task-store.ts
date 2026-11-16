@@ -43,10 +43,18 @@ export class TaskStore {
     return row ?? null;
   }
   async claimTask(id: string, token: string, at: Date) {
+    return this.claim(id, token, at);
+  }
+  // Queue consumers must fence the action in the same statement as the claim.
+  async claimTaskForAction(id: string, action: 'category' | 'tags' | 'scores', token: string, at: Date) {
+    return this.claim(id, token, at, action);
+  }
+  private async claim(id: string, token: string, at: Date, action?: 'category' | 'tags' | 'scores') {
     const [row] = await this.db.update(processingTasks).set({
       state: "running", executionToken: token, startedAt: at, updatedAt: at,
       attemptCount: sql`${processingTasks.attemptCount} + 1`,
-    }).where(and(eq(processingTasks.id, id), inArray(processingTasks.state, ["queued", "retry_wait"]))).returning();
+    }).where(and(eq(processingTasks.id, id), inArray(processingTasks.state, ["queued", "retry_wait"]),
+      action === undefined ? undefined : eq(processingTasks.action, action))).returning();
     return row ?? null;
   }
   // Fenced updates cannot commit results after ownership changes.

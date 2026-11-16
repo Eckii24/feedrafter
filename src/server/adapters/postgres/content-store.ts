@@ -1,4 +1,5 @@
-import { and, eq, gt, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { decodePreparationReceiptV1 } from "../../domain/article-handoff.js";
 import type { Database } from "./client.js";
 import { articleContents, contentChunks, chunkResults } from "./schema/enrichment.js";
 import { articles } from "./schema/import.js";
@@ -32,13 +33,14 @@ export class ContentStore {
     return row ?? null;
   }
 
-  async saveChunk(chunk: typeof contentChunks.$inferInsert) {
-    const [row] = await this.db.insert(contentChunks).values(chunk).returning();
+  async saveChunk(chunk: Omit<typeof contentChunks.$inferInsert, "planId" | "plannerChunkId" | "overlap" | "startSeconds" | "endSeconds">) {
+    const { id, articleId, contentRevision, ordinal, startOffset, endOffset, text } = chunk;
+    const [row] = await this.db.insert(contentChunks).values({ id, articleId, contentRevision, ordinal, startOffset, endOffset, text }).returning();
     return row!;
   }
 
   listChunks(articleId: string, revision: number) {
-    return this.db.select().from(contentChunks).where(and(eq(contentChunks.articleId, articleId), eq(contentChunks.contentRevision, revision))).orderBy(contentChunks.ordinal);
+    return this.db.select().from(contentChunks).where(and(eq(contentChunks.articleId, articleId), eq(contentChunks.contentRevision, revision), isNull(contentChunks.planId))).orderBy(contentChunks.ordinal);
   }
 
   async saveChunkResult(result: typeof chunkResults.$inferInsert) {
@@ -73,11 +75,13 @@ export class ContentStore {
         return article.revision;
       }
       const revision = article.revision + 1;
+      const receipt = decodePreparationReceiptV1({ version: 1, taskId: task.id, articleId: task.articleId, action: task.action, generation: task.generation, contentRevision: revision });
+      if (!receipt) throw new Error("invalid preparation receipt");
       const { text, quality, capturedAt, sourceUrl, limitation, failureCode } = outcome.content;
       const replacement = { text, quality, capturedAt, sourceUrl: sourceUrl ?? null, limitation: limitation ?? null, failureCode: failureCode ?? null, revision };
       await tx.update(articles).set({ contentRevision: revision }).where(eq(articles.id, context.articleId));
       await tx.insert(articleContents).values({ ...replacement, articleId: context.articleId }).onConflictDoUpdate({ target: articleContents.articleId, set: replacement });
-      await tx.update(processingTasks).set({ state: "succeeded", errorCode: null, updatedAt: outcome.at, endedAt: outcome.at }).where(eq(processingTasks.id, task.id));
+      await tx.update(processingTasks).set({ state: "succeeded", errorCode: null, result: { ...task.result, preparationReceipt: receipt }, updatedAt: outcome.at, endedAt: outcome.at }).where(eq(processingTasks.id, task.id));
       return revision;
     });
   }

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDatabase } from "../../src/server/adapters/postgres/client.js";
 import { migrateDatabase } from "../../src/server/adapters/postgres/migrate.js";
@@ -48,6 +49,83 @@ afterAll(async () => {
 });
 
 describe("PostgreSQL persistence", () => {
+  it("reports ordered inserted identities while preserving upserts and acknowledgements", async () => {
+    await migrateDatabase(database.pool);
+    const store = new ImportStore(database.db);
+    const context = await store.ensureContext(`identities-${randomUUID()}`, "account");
+    const second = { ...entry, id: "second", title: "Second" };
+    const duplicate = { ...entry, title: "Duplicate update", feedTitle: "Updated feed" };
+    const first = await store.importPageWithIdentities(context.id, [entry, second, duplicate], now);
+    expect(first).toEqual([
+      { id: expect.any(String), inserted: true },
+      { id: expect.any(String), inserted: true },
+      { id: first[0]!.id, inserted: false },
+    ]);
+    expect(first[0]!.id).not.toBe(first[1]!.id);
+    expect(await new ReaderStore(database.db).getArticle(first[0]!.id)).toMatchObject({ title: "Duplicate update", importedAt: now });
+    const source = await database.pool.query("select title from sources where context_id=$1", [context.id]);
+    expect(source.rows).toEqual([{ title: "Updated feed" }]);
+    await store.makePendingEligible(context.id);
+    const pending = await store.pendingAcknowledgements(context.id);
+    const ack = pending.find(item => item.freshrssId === entry.id)!.acknowledgement;
+    await store.recordAttempt(ack.id, now, "uncertain");
+    await store.confirm(ack.id, now);
+    const replay = await store.importPageWithIdentities(context.id, [second, entry], new Date("2026-02-01Z"));
+    expect(replay).toEqual([{ id: first[1]!.id, inserted: false }, { id: first[0]!.id, inserted: false }]);
+    const acknowledgements = await database.pool.query("select article_id, status, eligible, attempts, confirmed_at from freshrss_acknowledgements where context_id=$1", [context.id]);
+    expect(acknowledgements.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ article_id: first[0]!.id, status: "pending", eligible: false, attempts: 1, confirmed_at: null }),
+      expect.objectContaining({ article_id: first[1]!.id, status: "pending", eligible: true, attempts: 0 }),
+    ]));
+    expect(acknowledgements.rows).toHaveLength(2);
+    expect(await store.importPage(context.id, [second, entry, second], now)).toEqual([first[1]!.id, first[0]!.id, first[1]!.id]);
+    expect(await database.db.transaction(tx => store.importPageInTransaction(tx, context.id, [entry, second], now))).toEqual([first[0]!.id, first[1]!.id]);
+    const tasks = await database.pool.query("select count(*)::int as n from processing_tasks where article_id = any($1::uuid[])", [first.map(item => item.id)]);
+    expect(tasks.rows[0].n).toBe(0);
+  });
+
+  it("reports transaction rollback and concurrent identity replay correctly", async () => {
+    await migrateDatabase(database.pool);
+    const store = new ImportStore(database.db);
+    const context = await store.ensureContext(`identity-race-${randomUUID()}`, "account");
+    const item = { ...entry, feedId: null, feedTitle: null };
+    await expect(database.db.transaction(async tx => {
+      expect(await store.importPageWithIdentitiesInTransaction(tx, context.id, [item], now)).toEqual([{ id: expect.any(String), inserted: true }]);
+      throw new Error("rollback");
+    })).rejects.toThrow("rollback");
+    let release!: () => void;
+    let inserted!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { inserted = resolve; });
+    const first = database.db.transaction(async tx => {
+      const result = await store.importPageWithIdentitiesInTransaction(tx, context.id, [item], now);
+      inserted();
+      await held;
+      return result;
+    });
+    await ready;
+    let reportPid!: (pid: number) => void;
+    const pidReady = new Promise<number>(resolve => { reportPid = resolve; });
+    const second = database.db.transaction(async tx => {
+      const pid = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+      reportPid(pid.rows[0]!.pid);
+      return store.importPageWithIdentitiesInTransaction(tx, context.id, [item], now);
+    });
+    try {
+      const pid = await pidReady;
+      let blocked = false;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        const activity = await database.pool.query("select wait_event_type from pg_stat_activity where pid=$1", [pid]);
+        if (activity.rows[0]?.wait_event_type === "Lock") { blocked = true; break; }
+        await delay(20);
+      }
+      expect(blocked).toBe(true);
+    } finally { release(); }
+    const [created, replay] = await Promise.all([first, second]);
+    expect(created).toEqual([{ id: expect.any(String), inserted: true }]);
+    expect(replay).toEqual([{ id: created[0]!.id, inserted: false }]);
+  });
+
   it('pages globally by an explicit active score with nulls last and stable ties', async () => {
     await migrateDatabase(database.pool);
     const store = new ImportStore(database.db);

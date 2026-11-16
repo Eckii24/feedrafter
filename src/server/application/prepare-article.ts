@@ -1,9 +1,11 @@
 import type { ContentExecutionContext, ContentStore } from '../adapters/postgres/content-store.js';
 import { extractHtml } from '../adapters/web/extract.js';
 import { publicUrl } from '../adapters/web/public-url.js';
+import { normalizePermissionHost } from '../domain/source-permission.js';
 import type { PublicWeb, PublicWebResponse } from '../ports/public-web.js';
+import type { SourceFallbackPermission } from '../ports/source-fallback-permission.js';
 
-/** Ports are deliberately inert: no model, agent, network tools or source settings are wired here. */
+/** Ports are deliberately inert: no model, agent or production fallback is wired here. */
 export interface ArticleQualityClassifier {
   classify(input: { text: string; sourceUrl: string }, signal: AbortSignal): Promise<unknown>;
 }
@@ -16,13 +18,12 @@ type Dependencies = {
   content: Pick<ContentStore, 'publishTask'>;
   classifier: ArticleQualityClassifier;
   fallback?: ArticleExtractionFallback;
+  permission?: SourceFallbackPermission;
   now?: () => Date;
 };
 type Input = {
   context: ContentExecutionContext;
   originalUrl: string;
-  /** Explicit caller assertion, not a persisted source setting. Defaults to false. */
-  allowFallback?: boolean;
   signal?: AbortSignal;
 };
 const MAX_TEXT = 1_000_000;
@@ -60,7 +61,8 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
   const context = { ...input.context };
   let outcome: Parameters<ContentStore['publishTask']>[1];
   try {
-    const originalUrl = publicUrl(input.originalUrl).href;
+    const validatedOriginal = publicUrl(input.originalUrl);
+    const originalUrl = validatedOriginal.href;
     const response = await bounded(deps.web.get(originalUrl, signal), signal);
     if (response.status === 401 || response.status === 403 || response.status === 402) throw new Error('access_denied');
     if (response.status < 200 || response.status >= 300) throw new Error('fetch_failed');
@@ -72,7 +74,19 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
     let result = { text: extracted.text.trim(), sourceUrl: finalUrl };
     let quality = result.text ? assessment(await bounded(deps.classifier.classify(result, signal), signal)) : 'unusable';
     let fromFallback = false;
-    if (quality !== 'usable' && input.allowFallback === true && deps.fallback) {
+    if (quality !== 'usable' && deps.fallback) {
+      const permission = deps.permission;
+      if (!permission || await bounded(permission.resolveForArticle(context.articleId, validatedOriginal.hostname), signal) !== true) throw new Error('fallback_permission_denied');
+      const originalHost = normalizePermissionHost(validatedOriginal.hostname);
+      const authorizeTarget = async (url: string, targetSignal: AbortSignal) => {
+        let host: string;
+        try { host = normalizePermissionHost(publicUrl(url).hostname); } catch { throw new Error('fallback_permission_denied'); }
+        const decision = host === originalHost
+          ? permission.resolveForArticle(context.articleId, originalHost)
+          : permission.resolveHost(host);
+        if (await bounded(decision, targetSignal) !== true) throw new Error('fallback_permission_denied');
+        targetSignal.throwIfAborted();
+      };
       const fetched = new Set([originalUrl, finalUrl]);
       let calls = 0;
       let closed = false;
@@ -81,10 +95,12 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
         const inspection = (async () => {
           if (closed || ++calls > 20) throw new Error('fallback_fetch_limit');
           const safe = publicUrl(url).href;
-          const page = await bounded(deps.web.get(safe, signal), signal);
+          await authorizeTarget(safe, signal);
+          const page = await bounded(deps.web.get(safe, signal, { authorizeTarget }), signal);
           if ([401, 402, 403].includes(page.status)) throw new Error('access_denied');
           if (page.status < 200 || page.status >= 300 || !Buffer.isBuffer(page.body) || page.body.length > 10 * 1024 * 1024) throw new Error('fallback_fetch_failed');
           const final = publicUrl(page.finalUrl).href;
+          await authorizeTarget(final, signal);
           const type = page.headers['content-type'];
           if (typeof type !== 'string') throw new Error('not_html');
           const extracted = await extractHtml(page.body, signal, { contentType: type });
@@ -105,6 +121,7 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
       if (rejected.length) throw rejected.find(item => item.reason instanceof Error && item.reason.message === 'access_denied')?.reason ?? rejected[0]!.reason;
       result = candidate(fallbackResult);
       if (!fetched.has(result.sourceUrl)) throw new Error('invalid_fallback');
+      await authorizeTarget(result.sourceUrl, signal);
       if (ACCESS.test(result.text)) throw new Error('access_denied');
       quality = assessment(await bounded(deps.classifier.classify(result, signal), signal));
       fromFallback = true;
@@ -114,7 +131,7 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
     const at = now();
     outcome = { kind: 'success', at, content: { text: result.text, sourceUrl: result.sourceUrl, quality: 'usable', limitation: fromFallback ? 'fallback; quality is heuristic' : 'quality is heuristic', capturedAt: at } };
   } catch (error) {
-    const allowed = new Set(['invalid_classifier', 'invalid_fallback', 'access_denied', 'fetch_failed', 'not_html', 'unsupported_encoding', 'content_uncertain', 'content_unusable']);
+    const allowed = new Set(['invalid_classifier', 'invalid_fallback', 'access_denied', 'fetch_failed', 'not_html', 'unsupported_encoding', 'content_uncertain', 'content_unusable', 'fallback_permission_denied']);
     const message = error instanceof Error ? error.message : '';
     outcome = { kind: 'failure', errorCode: signal.aborted ? 'cancelled_or_timeout' : allowed.has(message) ? message : 'preparation_failed', at: now() };
   }

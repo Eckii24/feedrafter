@@ -9,6 +9,7 @@ export type TerminalUsage = {
   inputTokens: number | null;
   outputTokens: number | null;
   costUsd: number | null;
+  /** 'provider' means every non-null token count was independently reported by the provider. */
   tokensSource: 'provider' | 'unknown';
   costSource: 'provider' | 'unknown';
   outcomeCode: string | null;

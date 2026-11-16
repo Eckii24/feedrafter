@@ -62,6 +62,20 @@ describe('FreshRSS read adapter', () => {
     expect(() => new FreshRssClient({ baseUrl: url, email: 'u', password: 'p' })).toThrow('Invalid FreshRSS configuration');
   });
 
+  it('discards an expired auth token and reauthenticates on the next scan', async () => {
+    let logins = 0;
+    const tokens: string[] = [];
+    const transport: typeof fetch = async (input, init) => {
+      if (String(input).endsWith('/ClientLogin')) return new Response(`Auth=token-${++logins}\n`);
+      tokens.push(new Headers(init?.headers).get('authorization')!);
+      return tokens.length === 1 ? new Response('expired', { status: 401 }) : Response.json({ items: [] });
+    };
+    const client = new FreshRssClient({ baseUrl, email: 'u', password: 'p', transport });
+    await expect(client.listUnreadPage()).rejects.toThrow('FreshRSS request failed');
+    expect(await client.listUnreadPage()).toEqual({ items: [], continuation: null });
+    expect(tokens).toEqual(['GoogleLogin auth=token-1', 'GoogleLogin auth=token-2']);
+  });
+
   it('never sends a mutation while acknowledgement is disabled', async () => {
     let calls = 0;
     const transport: typeof fetch = async () => { calls++; return new Response(''); };

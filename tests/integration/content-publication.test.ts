@@ -7,6 +7,8 @@ import { migrateDatabase } from '../../src/server/adapters/postgres/migrate.js';
 import { ContentStore, type ContentExecutionContext } from '../../src/server/adapters/postgres/content-store.js';
 import { TaskStore } from '../../src/server/adapters/postgres/task-store.js';
 import { prepareArticle } from '../../src/server/application/prepare-article.js';
+import type { SourceFallbackPermission } from '../../src/server/ports/source-fallback-permission.js';
+import { readPreparationReceipt } from '../../src/server/domain/article-handoff.js';
 
 const docker = (...args: string[]) => execFileSync('docker', ['--host', 'unix:///var/run/docker.sock', ...args], { encoding: 'utf8' }).trim();
 let container = '';
@@ -116,10 +118,45 @@ describe('atomic content task publication', () => {
   it('commits valid success and clears old provenance at the same revision', async () => {
     const f = await fixture();
     const ctx = await f.admit(1);
+    await database.pool.query('update processing_tasks set result=$2 where id=$1', [ctx.taskId, { unrelated: { keep: true } }]);
     expect(await f.content.publishTask(ctx, { kind: 'success', content: replacement, at })).toBe(2);
     expect(await f.snapshot()).toMatchObject({ content_revision: 2, revision: 2, text: 'replacement', quality: 'usable', source_url: null, limitation: null, failure_code: null });
-    expect(await f.tasks.getTask(ctx.taskId)).toMatchObject({ state: 'succeeded', endedAt: at, errorCode: null, attemptCount: 1 });
+    const task = await f.tasks.getTask(ctx.taskId);
+    expect(task).toMatchObject({ state: 'succeeded', endedAt: at, errorCode: null, attemptCount: 1, result: { unrelated: { keep: true } } });
+    expect(readPreparationReceipt(task?.result)).toEqual({ version: 1, taskId: ctx.taskId, articleId: f.id, action: 'prepare', generation: 1, contentRevision: 2 });
     expect(await f.content.publishTask(ctx, { kind: 'failure', errorCode: 'late', at })).toBeNull();
+  });
+
+  it('does not synthesize missing or malformed receipts on legacy successes', async () => {
+    const f = await fixture();
+    for (const result of [null, { preparationReceipt: { version: 0 }, keep: true }]) {
+      const task = await f.tasks.createTask({ articleId: f.id, action: 'prepare', generation: 0, state: 'succeeded', result, createdAt: at, updatedAt: at });
+      const before = await f.tasks.getTask(task.id);
+      expect(readPreparationReceipt(before?.result)).toBeNull();
+      expect(await f.tasks.getTask(task.id)).toEqual(before);
+    }
+  });
+
+  it('preserves task metadata on failure and rollback at commit', async () => {
+    const f = await fixture();
+    const failed = await f.admit(1);
+    const metadata = { keep: { nested: 1 }, preparationReceipt: { legacy: true } };
+    await database.pool.query('update processing_tasks set result=$2 where id=$1', [failed.taskId, metadata]);
+    const before = await f.snapshot();
+    expect(await f.content.publishTask(failed, { kind: 'failure', errorCode: 'failure', at })).toBe(1);
+    expect(await f.snapshot()).toEqual(before);
+    expect(await f.tasks.getTask(failed.taskId)).toMatchObject({ state: 'failed', result: metadata });
+    const ctx = await f.admit(2);
+    await database.pool.query('update processing_tasks set result=$2 where id=$1', [ctx.taskId, metadata]);
+    const taskBefore = await f.tasks.getTask(ctx.taskId);
+    await database.pool.query("create function reject_receipt_commit() returns trigger language plpgsql as $$ begin if new.state='succeeded' then raise exception 'deferred receipt failure'; end if; return new; end $$; create constraint trigger reject_receipt_commit after update on processing_tasks deferrable initially deferred for each row execute function reject_receipt_commit()");
+    try {
+      await expect(f.content.publishTask(ctx, { kind: 'success', content: replacement, at })).rejects.toThrow();
+      expect(await f.snapshot()).toEqual(before);
+      expect(await f.tasks.getTask(ctx.taskId)).toEqual(taskBefore);
+    } finally {
+      await database.pool.query('drop trigger reject_receipt_commit on processing_tasks; drop function reject_receipt_commit()');
+    }
   });
 
   it('rolls back content and revision when the task transition fails', async () => {
@@ -167,18 +204,24 @@ describe('atomic content task publication', () => {
     const ctx = await f.admit(1);
     const before = await f.snapshot();
     const article = `<html><body><article><p>${'Detailed factual reporting. '.repeat(80)}</p></article></body></html>`;
-    const web = { get: async (url: string) => ({
-      finalUrl: url, status: url.includes('/fallback') && scenario === '403' ? 403 : 200,
-      headers: { 'content-type': scenario === 'charset' ? 'text/html; charset=iso-8859-1' : 'text/html' },
-      body: Buffer.from(url.includes('/fallback') && scenario === 'paywall' ? '<html><body>Subscription required</body></html>' : article),
-    }) };
+    const fetched: string[] = [];
+    const web = { get: async (url: string) => {
+      fetched.push(url);
+      return {
+        finalUrl: url, status: url.includes('/fallback') && scenario === '403' ? 403 : 200,
+        headers: { 'content-type': scenario === 'charset' ? 'text/html; charset=iso-8859-1' : 'text/html' },
+        body: Buffer.from(url.includes('/fallback') && scenario === 'paywall' ? '<html><body>Subscription required</body></html>' : article),
+      };
+    } };
     let classifications = 0;
     const classifier = { classify: async () => ++classifications === 1 ? { probability: 0.1, usable: false } : { probability: 0.9, usable: true } };
     const fallback = { extract: async ({ webFetch }: { webFetch: (url: string) => Promise<unknown> }) => {
       await webFetch('https://example.com/fallback').catch(() => {});
       return { text: article, sourceUrl: 'https://example.com/article' };
     } };
-    expect(await prepareArticle({ content: f.content, web, classifier, fallback, now: () => at }, { context: ctx, originalUrl: 'https://example.com/article', allowFallback: true })).toEqual({ status: 'failed', revision: 1 });
+    const permission: SourceFallbackPermission = { resolveForArticle: async (id, hostname) => id === f.id && hostname === 'example.com', resolveHost: async () => false };
+    expect(await prepareArticle({ content: f.content, web, classifier, fallback, permission, now: () => at }, { context: ctx, originalUrl: 'https://example.com/article' })).toEqual({ status: 'failed', revision: 1 });
+    expect(fetched).toEqual(scenario === 'charset' ? ['https://example.com/article'] : ['https://example.com/article', 'https://example.com/fallback']);
     expect(await f.snapshot()).toEqual(before);
     expect(await f.tasks.getTask(ctx.taskId)).toMatchObject({ state: 'failed', errorCode: scenario === 'charset' ? 'unsupported_encoding' : 'access_denied' });
   });
