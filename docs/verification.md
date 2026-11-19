@@ -2,6 +2,212 @@
 
 **D1 is not accepted.** This record is evidence, not implementation approval. Criteria are defined in [the specification](dev-agentic-news-reader-spec.md); V1–V9 are defined in `.ai/news-reader-plan.md`. Baseline AC14/AC21 means only the D1 reader/operations subset, not later score, Pi or enrichment requirements. Results below are for this local run, not the deployed system.
 
+## P2 — local real-server product exercise
+
+P2 source and tests are implemented, uncommitted. `src/server/http/app.ts` exposes sanitized action-discriminated category/tag task status and includes those actions in advisory task-change polling. `tests/helpers/article-processing-fixture.ts` owns a uniquely named disposable PostgreSQL 18 container, migrations, real PgBoss, fake AI, real in-memory-HTML preparation and test-only `ArticleJobs` admission. It does not accept a DB URL or add a fake-AI runtime switch. `tests/integration/article-processing-api.test.ts` exercises real loopback HTTP status, waiting/paused/failed states, unsupported IDs/actions, sanitized fields and post-update SSE invalidations. Existing `karakeep.test.ts` and `score-worker.test.ts` preserve the other task DTOs.
+
+`tests/e2e/enrichment.spec.ts` serves the built UI from Fastify and uses real HTTP, real workers and persistence, with no browser API interception. It verifies category/tags and score basis after reload, then score-only reevaluation to a new generation/value and a failed attempt preserving the previous value and exposing its error. Synthetic preparation fetch count and category/tag AI call counts remain unchanged across reevaluations. Other score browser tests below mock API responses and are UI regressions only.
+
+Commands run from repository root with Node 24.21.0, cached `postgres:18`, local Docker socket and no provider credentials:
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-processing-api.test.ts tests/integration/karakeep.test.ts tests/integration/score-worker.test.ts
+# 3 files / 14 tests passed on final code
+mise exec node@24.21.0 -- npm run typecheck
+mise exec node@24.21.0 -- npm run lint
+mise exec node@24.21.0 -- npm run build
+mise exec node@24.21.0 -- ./node_modules/.bin/drizzle-kit check
+# all passed on final code
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$HOME/.cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell" mise exec node@24.21.0 -- npm run test:e2e -- tests/e2e/enrichment.spec.ts tests/e2e/score-results.spec.ts tests/e2e/score-reevaluation.spec.ts
+# 6 passed on final code; Chromium 153.0.8010.12
+mise exec node@24.21.0 -- npm run test:unit
+# 37 files / 684 tests passed
+mise exec node@24.21.0 -- npm run test:integration
+# 44 files / 932 tests passed
+```
+
+The full unit/integration runs preceded the final diagnostic schema discrimination and fixture/test assertion refinements; the affected API, Karakeep, score-worker and browser checks above were rerun afterward. The first browser command without an override failed all six at launch: Playwright expected uncached revision 1248. The existing 1243 headless shell above was verified with `--version` and the rerun passed. No browser download was performed.
+
+**Independent P2 review:** Reviewed HTTP, fixture, browser/API tests, composition and security. No blocking or important findings; corrected a stale supported-action sentence in `docs/server-api.md`. Reviewer reran API/security/compatibility checks (4 files / 20 tests), V5 (6 browser tests), typecheck, lint, Drizzle check and whitespace checks. Review also inspected the prior composition dormancy repair. Build and full suites were not independently rerun.
+
+**Limits and gates:** Aggregate P1/P2 local acceptance is not claimed; focused checks and the real-server exercise are not a replacement for all acceptance gates. Normal serve does not register category/tag workers, and score execution remains fail-closed. This is direct-only prepared text, not automatic import, recovery, live-model quality, accounting, deployment or populated-target compatibility. NR-C14/D2/NR-V10 remain incomplete. G1–G5 still require target and rollback authorization; provider/model/auth and compatibility; consent and bounded article scope; budget/caps/stop policy; and separately authorized live procedure. No provider call, live data, deployment, staging or commit. See `.ai/product-test-readiness-plan.md` for the complete gate register.
+
+## P1.4 — independent-review composition gap repair
+
+The supplied independent-review finding identified missing normal-composition evidence that category/tags queues are neither provisioned nor worker-registered. The existing `tests/integration/score-worker.test.ts` normal `buildApplication` case now checks that neither queue exists before or after startup, observes real PgBoss `createQueue` and `work` calls without replacing their implementations, and asserts score-worker registration as a positive control. Its existing `ModelRuntime.create` and `fetch` spies remain. This is a test-only repair; it does not change composition or provision queues.
+
+On Node 24.21.0 with disposable PostgreSQL 18 and real PgBoss:
+
+- `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/score-worker.test.ts --reporter=dot` — **1 file / 6 tests passed**.
+- `mise exec node@24.21.0 -- npm run typecheck` and `mise exec node@24.21.0 -- npm run lint` — passed.
+
+The reported gap is covered locally; the repair has not received a fresh independent review. No other review conclusions are inferred from the supplied finding. Full suites and build were not rerun for this test-only change; no provider, deployment or production activation. P1/P2 acceptance remains open.
+
+## P1.4 — expanded real-worker delivery evidence
+
+On Node 24.21.0, disposable PostgreSQL 18 and real retry-disabled PgBoss deliveries with fake AI, `tests/integration/article-worker.test.ts` now exercises linked category/tag/score handoff tampering before load and during inference, including missing/null/old roots, wrong anchor, receipt identity/generation, rewired links, zero-generation references and a tag moved to another article. Newer tag generations fence tags and scores. Standalone generation-zero category/tag/score deliveries succeed; malformed namespaces fail before AI, and a namespace inserted during inference prevents publication. Wrong-action deliveries, duplicate jobs with obsolete owners, prior-score preservation, failing/paused/configuration/oversized tasks, successful score siblings, a separate successful article, and a later score definition are also covered. Barriers hold actual in-flight worker calls; tests inspect persisted tasks, receipts, results and queue completion. A structurally valid wrong category anchor is rejected at publication, not load.
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts --reporter=dot
+# V1: 1 file / 6 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-jobs.test.ts tests/integration/content-publication.test.ts tests/integration/categorize.test.ts tests/integration/categorize-races.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-admission.test.ts --reporter=dot
+# V2: 7 files / 287 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-worker.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-worker.test.ts tests/integration/enrichment.test.ts --reporter=dot
+# V3: 5 files / 399 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-worker.test.ts tests/integration/enrichment.test.ts --reporter=dot
+# V12: 2 files / 277 tests passed
+mise exec node@24.21.0 -- npm run typecheck
+mise exec node@24.21.0 -- npm run lint
+mise exec node@24.21.0 -- npm run build
+mise exec node@24.21.0 -- ./node_modules/.bin/drizzle-kit check
+# all passed on the final test code
+```
+
+`npm run test:unit` passed 37 files / 684 tests. `npm run test:integration` passed 43 files / 926 tests before the last five worker cases and the later-definition/misroute assertion extensions; final V3/V12 include those changes. No application source was changed in this coverage pass. One new wrong-anchor test initially expected a pre-load rejection and timed out: the category loader accepts a structurally valid anchor, and the real publisher checks the anchored successor. Correcting the test to assert publication rejection passed the focused and final suites.
+
+**Limits:** These cases do not exhaust every possible malformed ancestry permutation or assert exact configuration/AI call counts for the obsolete-owner duplicate itself. Full integration was not rerun after the final test-only additions. The supplied independent review identified the composition gap repaired above; no fresh independent review of that repair is claimed. P2 real-server/browser acceptance, provider behavior, crash recovery, populated-target compatibility and production activation remain unverified. No provider call, production use, staging or commit. Passing tests are evidence, not user acceptance.
+
+## P1.4 — additional real-worker fences (historical; superseded by evidence above)
+
+Disposable PostgreSQL 18, real retry-disabled PgBoss jobs and fake AI: 42 barrier-controlled combinations exercise title, source identity, content revision, category assignment, tag assignment, and newer prepare/category generations before load and during inference at each category, tags and scores stage. Tests inspect task state/error, absent success receipt, exact completed queue job and retry limit, unchanged post-edit article/associations, absent scores and unreleased successors. Category before-load content revision mismatch is `needs_input/invalid_handoff`; the other tested cases settle `superseded/stale_basis`. For score inference, the first score is held in flight; remaining scores subsequently encounter the edit before load. Edits use test SQL (including assignment revision changes), not API endpoints.
+
+A separate real-delivery test changes score prompt, model and selected fields after tag handoff, retires one score definition, and advances the catalog epoch before score dispatch. It observes the new request for the two eligible siblings: one pauses on auth and one persists 50; the retired sibling is superseded without AI or a score. All three real jobs complete. This does not demonstrate preservation of a previously saved score or independence between two articles.
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-worker.test.ts tests/integration/enrichment.test.ts
+# V12 command: 2 files / 157 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-worker.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-worker.test.ts tests/integration/enrichment.test.ts
+# V3 command: 5 files / 279 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/unit/process-context-chunks.test.ts tests/integration/article-jobs.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts
+# aggregate V11: 9 files / 497 tests passed, before final test-only edits
+mise exec node@24.21.0 -- npm run typecheck
+mise exec node@24.21.0 -- ./node_modules/.bin/eslint tests/integration/article-worker.test.ts
+# both passed after final test edits
+```
+
+The initial new matrix run failed (26 of 38): the fixture resolved a model inconsistent with the configured category role and expected `stale_basis` for the category preparation-receipt mismatch. A focused diagnostic showed `configuration_required`; correcting the fixture model and expected `invalid_handoff` produced passing focused and aggregate runs. No application source changed. The earlier checkpoint below retains its historical counts.
+
+**Historical remaining work:** At this earlier run, linked-handoff, standalone/malformed-root, newer tag, obsolete-token, independence and failure/oversize worker coverage remained incomplete. See the newer evidence above for subsequent coverage and current limits.
+
+## P1.4 — stored workers and real-queue checkpoint (acceptance open)
+
+Added action-fenced stored category/tag executors, explicit administrative queue provisioning in `main.ts migrate`, and independently closable article registrations. Normal `buildApplication` does not register article workers or resolve their models. Tests assemble fake-backed workers explicitly; no provider or populated database was used. `ImportStore.importPageWithIdentities` creates the synthetic identity; preparation uses in-memory public HTML and a fake quality classifier, with no fallback. Admission is test orchestration, not automatic import.
+
+A disposable uniquely named PostgreSQL 18 container and real PgBoss deliver preparation → admitted category → anchored tags → three original score tasks. The test checks ordered fake requests, selected score fields and post-tag category/tag context, task receipts, actual job completion and persisted native-score results `0`, `37.5`, `100`. It also checks duplicate/misrouted deliveries, action-fenced configuration resolution, explicit migrate provisioning, category pause and stale outcomes, title changes before category/tag/score load and during category inference, and draining article registrations without stopping an unrelated worker. Real queue jobs are retry-disabled; this is not evidence of recovery after interruption, automatic resume, provider retries, exactly-once inference or live model quality.
+
+Node `24.21.0` via mise, local `postgres:18` (`--pull=never`):
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-worker.test.ts tests/integration/enrichment.test.ts
+# V12 command: 2 files / 114 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts
+# V1: 1 file / 6 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-jobs.test.ts tests/integration/content-publication.test.ts tests/integration/categorize.test.ts tests/integration/categorize-races.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-admission.test.ts
+# V2: 7 files / 287 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-worker.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-worker.test.ts tests/integration/enrichment.test.ts
+# V3 command: 5 files / 236 tests passed
+mise exec node@24.21.0 -- npm run typecheck
+mise exec node@24.21.0 -- npm run lint
+mise exec node@24.21.0 -- npm run build
+mise exec node@24.21.0 -- npm run test:unit
+# 37 files / 684 tests passed
+mise exec node@24.21.0 -- npm run test:integration
+# 43 files / 768 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/drizzle-kit check
+# typecheck, lint, build and schema check passed
+```
+
+V1/V2 and the full unit suite were run before the final worker-test fixture additions; the final full integration suite includes V2. The first worker test run failed because the test omitted the required admission timestamp and used the score/category/tag-only claim API for preparation; using the required timestamp and existing generic preparation claim fixed the fixture. Typecheck caught both test errors. At this historical checkpoint, passing commands did **not** establish the full per-stage edit matrix, changed dispatch configuration or independent sibling outcomes via real delivery. See the later P1.4 entry above for added coverage and remaining gaps. P1.4 implementation is present, but aggregate P1 acceptance remains open pending those cases and review. P2 HTTP/browser acceptance, G1–G5 and NR-C14/D2/NR-V10 remain open; no activation or deployment is authorized by this checkpoint.
+
+Changed checkpoint paths: `src/server/application/run-stored-category-task.ts`, `src/server/application/run-stored-tag-task.ts`, `src/server/adapters/postgres/article-worker.ts`, `src/server/main.ts`, `tests/integration/article-worker.test.ts`, `tests/unit/stored-article-task.test.ts`, `.ai/product-test-readiness-plan.md`, and this evidence record. Earlier uncommitted P1.1–P1.3 work remains separate.
+
+## P1.3c — independent-review test gaps
+
+Added real-chain `ArticleJobs` in-flight regressions for zero-generation tag and score references, removed preparation/category receipts, and newer prepare/category/tag generations. They assert stale settlement without tag publication, receipt, assignment/catalog changes or score release, while preserving the tampered history. A deferred PostgreSQL commit failure verifies that an unavailable original target was retired and a later eligible sibling had a real score job inside the transaction, then asserts the retirement state/error/timestamps, tag publication and score job all rolled back. Fake AI only; no provider calls.
+
+Node 24.21.0 via mise, disposable PostgreSQL 18 and real PgBoss:
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-jobs.test.ts
+# 1 file / 114 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/unit/process-context-chunks.test.ts tests/integration/article-jobs.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts
+# aggregate V11: 9 files / 497 tests passed
+mise exec node@24.21.0 -- npm run typecheck
+mise exec node@24.21.0 -- ./node_modules/.bin/eslint tests/integration/article-jobs.test.ts
+git diff --check && git diff --cached --check
+# typecheck, scoped lint and both diff checks passed
+```
+
+No production source changed for this gap repair. No separate V11c rerun, build, full V6 regression, new independent review, stored-worker or production acceptance is claimed. No commits.
+
+## P1.3c — atomic tag producer and original-score release
+
+Node 24.21.0 via mise, disposable PostgreSQL 18, real PgBoss and fake AI. Real preparation, admission, category publication and `assignTags` now release the original eligible score tasks; the real score loader/kernel/publisher processes them. No synthetic activation or provider calls. Empty snapshots, empty/new/existing tags, target retirement, newer explicit score admission, terminal preservation, linkage tampering, job-ID mismatch, second-send/invalid-ID/update/deferred-commit rollback, lost responses and independent-session locks at a deferred commit barrier are covered. A generation-zero standalone matrix covers the ArticleJobs publisher.
+
+- V11c: `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-jobs.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts` — **5 files / 320 tests passed**.
+- Aggregate V11: `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/unit/process-context-chunks.test.ts tests/integration/article-jobs.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts` — **9 files / 490 tests passed**.
+- `mise exec node@24.21.0 -- npm run typecheck`, `npm run lint` and `npm run build` passed. No independent review or full V6 regression is claimed. Stored workers, actual queue deliveries, API/browser acceptance and production activation remain open.
+
+Historical checkpoint entries below describe their state at the time, not the current integrated state.
+
+## P1.3b — linked-score consumer checkpoint
+
+Implemented the linked score loader, immutable kernel capture and publication revalidation together. Persisted prerequisite/namespace classification keeps explicit score roots distinct; the shared validator checks the anchored preparation/category/tags ancestry, receipts, activated bases, fingerprint, content and newer generations. Publication repeats that validation and compares the captured link, independently of the historical receipt epoch.
+
+Consumer-only fixtures create real preparation, category and tags receipts through their publishers, then seed scheduling metadata; they do not establish atomic release. Real loader/kernel/publisher and stored-executor tests cover successful linked scoring, selected fields/native mapping, nested snapshot isolation, malformed/rewired/obsolete ancestry, in-flight tampering and preservation of prior scores. No linked tag publication was enabled.
+
+Node 24.21.0 via mise, disposable PostgreSQL 18 and fake AI only:
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/process-context-chunks.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts
+# 5 files / 283 tests passed
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/enrichment.test.ts
+# 4 files / 200 tests passed
+mise exec node@24.21.0 -- npm run typecheck
+mise exec node@24.21.0 -- ./node_modules/.bin/eslint src/server/adapters/postgres/score-handoff.ts src/server/adapters/postgres/score-task-input-store.ts src/server/adapters/postgres/score-store.ts src/server/application/process-context-chunks.ts tests/helpers/linked-score-fixture.ts tests/unit/process-context-chunks.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/enrichment.test.ts
+git diff --check && git diff --cached --check
+```
+
+Typecheck, scoped lint and diff checks passed. Independent correctness/security/spec review reran V11b (283) and V11a (200), typecheck and scoped lint; no production defect found. Review identified that the stored-executor tampering matrix accepted either stale or invalid results. The matrix now asserts exact task state and error code before inference and publication rejection during inference; the updated executor suite passed 107 tests, followed by typecheck, scoped ESLint and `git diff --check`. No aggregate V11, full suite, build, release, stored category/tag workers, deployment or production acceptance is claimed. P1.3c and its real producer-to-score proof remain open. The baseline-only record below describes the earlier checkpoint, not this implementation.
+
+## P1.3a — Pi fixture preservation and independent full review
+
+Fixed point: P1.3a worktree delta against `ac7588b095e805d8e7b4c43b3ed236ffabdcfa8c`: `src/server/adapters/postgres/{catalog-store,tag-task-input-store}.ts`, `src/server/application/assign-tags.ts`, and `tests/integration/{assign-tags,assign-tags-races,enrichment,pi-generator}.test.ts`. Existing unrelated worktree changes were excluded. Node 24.21.0 via mise; disposable PostgreSQL 18, real PgBoss, fake/intercepted loopback TLS AI only.
+
+The broader preservation run initially passed nine files / 363 tests, but the Pi suite failed first with `Task ended before fixture: needs_input`. Its tags test created a succeeded category task without a receipt; the loader correctly rejected it before AI. The losing shared `next()` waiter then displaced subsequent fixture handshakes. Unchanged code with only that case excluded passed **47 tests / 1 skipped**, supporting the cascade diagnosis rather than an independent TLS/auth regression. Expert source diagnosis confirmed the missing receipt and waiter mechanism; all later failures were not individually diagnosed.
+
+The fixture now creates/claims the category task and publishes through the real `CatalogStore.publishCategoryCandidate`, asserting its returned receipt before running tags. No receipt fabrication, runtime change or validation relaxation. Existing automatic-bucket reservation/settlement and exactly-one-wire assertions remain. Worker reproduction: isolated test failed before the edit, then passed **1 / 47 skipped**; full Pi suite passed **48 tests**.
+
+Final worker and independent reviewer both passed this exact command (**10 files / 411 tests**):
+
+```sh
+mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/integration/article-jobs.test.ts tests/integration/content-publication.test.ts tests/integration/categorize.test.ts tests/integration/categorize-races.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts tests/integration/pi-generator.test.ts --reporter=default
+```
+
+Fresh independent full review of those seven changed files found **no findings**. Supplied SHA-256 hashes matched before and after review. Reviewer also passed V11a plus Pi preservation (**5 files / 247 tests**), `mise exec node@24.21.0 -- npm run typecheck`, scoped ESLint on all seven paths and scoped `git diff --check`. The coordinator's `npm run build`, typecheck and six-file source/test ESLint passed before the Pi test-only correction; worker/reviewer typecheck and scoped lint passed afterward. Build was not independently rerun, and no application source changed after the passing build.
+
+This establishes P1.3a preservation/review only. P1.3b/c, score release, stored category/tag workers, aggregate V11/P1, real-server/browser product acceptance and production acceptance remain open. No live provider, populated target database, deployment or inference activation was used. No commits created.
+
+## P1.3b — baseline only, implementation not completed
+
+Fresh V0: HEAD `ac7588b095e805d8e7b4c43b3ed236ffabdcfa8c`; the seven P1.3a tracked modifications recorded below remain present, with only `.vitest/json/output.json` untracked. Node 24.21.0 via mise, Docker 29.8.0 and cached `postgres:18` were available. `git diff --check` and `git diff --cached --check` passed.
+
+Before P1.3b changes, `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/process-context-chunks.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts` passed **5 files / 200 tests**. The predecessor V11a command `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/enrichment.test.ts` passed **4 files / 199 tests**. Baseline `mise exec node@24.21.0 -- npm run typecheck` and ESLint on the three planned P1.3b source paths and five planned test paths passed. These are existing regressions only, not linked-score consumer evidence.
+
+No P1.3b source or test implementation was completed. After expert diagnosis and the coordinator's clarified defaults (approved by the user), the final repair handoff again returned no changes; its cause remains unknown. No post-implementation V11b, linked consumer tampering matrix, score release, aggregate V11, build, or production acceptance is claimed. The indivisible loader/kernel/publisher path and its real-receipt consumer tests remain unimplemented and must not be split into bypassable partial deliveries under the current plan.
+
+## P1.3a — tag capture and standalone publication checkpoint
+
+Fresh baseline: HEAD `ac7588b095e805d8e7b4c43b3ed236ffabdcfa8c`, no tracked or staged changes, pre-existing untracked `.vitest/json/output.json`. Node 24.21.0 via mise; Docker 29.8.0 and cached `postgres:18` were available. The test uses a real category publisher and disposable PostgreSQL.
+
+`mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/enrichment.test.ts -t 'standalone tag publication persists its receipt'` initially passed 1 test / 94 skipped with assertions that tag publication succeeded, returned no receipt and `readHandoffReceipt(saved.result)` was null. Changing that test to require a receipt produced the expected specific failure: `expected null to match object` containing the tag task ID, action `tags` and generation 1 (1 failed / 94 skipped). That positive-contract test was retained for the implementation below; no production source had changed at that baseline.
+
+At baseline, `mise exec node@24.21.0 -- npm run typecheck`, `mise exec node@24.21.0 -- ./node_modules/.bin/eslint tests/integration/enrichment.test.ts`, `git diff --check` and `git diff --cached --check` passed.
+
+Final implementation: `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/enrichment.test.ts` passed **4 files / 199 tests** on Node 24.21.0, disposable PostgreSQL 18 and PgBoss. Coverage includes real preparation/admission/category publication and activated tag capture with zero and one score target; root anchor, activation, positive-reference, newer-generation, fingerprint and article-basis fences; immutable capture through the kernel; and both catalog entry points rejecting linked and malformed namespaces without publication. Standalone receipts include generation zero and positive generation, returned/persisted post-transition basis and epoch, preserved unrelated result metadata, late rejection, deferred-commit rollback, cancellation and ambiguous-response regressions. Valid linked capture is not linked publication success.
+
+During added regression development, V11a reported three fixture failures (ambiguous JSON SQL operator and invalid source foreign keys) and typecheck found optional-property/connection-string test typing errors. One targeted fixture/type repair resolved them; the full command and typecheck passed afterward. Final `mise exec node@24.21.0 -- npm run typecheck` and scoped ESLint on the three changed source files and three changed integration tests passed; `git diff --check` and `git diff --cached --check` passed. Build and aggregate V11 were not run. P1.3b/P1.3c, score release, workers, aggregate P1.3 and production acceptance remain outside this checkpoint.
+
 ## P1.2 review repair — standalone receipt generation
 
 V1 category and tags receipts accept generation 0 through 2,147,483,647. Handoff references, including chain metadata, and preparation receipts remain positive. New chain admissions stay positive; the V1 JSON shape and root `tagsTaskId` contract are unchanged. Standalone receipts fingerprint the locked article row, not inference-request freshness. Both standalone category publishers persist and return the receipt with task success and assignment, preserve unrelated metadata and create no chain or tags job. `ArticleJobs` validates the stored chain receipt and uses its basis for the exact tags successor.
@@ -662,6 +868,22 @@ Node 24.21.0 coordinator run: `mise exec node@24.21.0 -- npm exec -- vitest run 
 Article detail now admits reevaluation only on explicit action, shows authoritative GET status and error codes, and refreshes on SSE/reconnect and bounded polling. A lost POST response is ambiguous; a fresh action creates new generations. Status is not persisted across article navigation. Normal backend composition and inference configuration are unchanged. C14/C15, D2 and V10 remain incomplete; no acceptance is claimed.
 
 Under Node 24.21.0, `npx --no-install playwright test tests/e2e/score-reevaluation.spec.ts tests/e2e/reader.spec.ts` passed **18 tests** using cached Chromium 1243 via `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`; mocks cover admission, authoritative status, polling, SSE response races, navigation, offline behavior, HTTP rejection, and lost-response ambiguity. The default Playwright browser launch initially failed because its expected browser revision was not installed; no download was attempted. After independent review found the stale-response test could pass after a later poll masked regression, the test was repaired to hold later poll responses and assert the refreshed authoritative state before releasing them. Coordinator rerun: focused reevaluation Playwright **4 passed**, typecheck, scoped ESLint and diff checks passed. Fresh independent full review found no actionable findings and independently reran reader + reevaluation Playwright (**18 passed**), typecheck, scoped lint, web build and whitespace checks. No real-store E2E, live inference, provider call, deployment, full suite or external acceptance was run for this UI slice.
+
+## P1.3c — partial score enqueue and standalone wrapper checkpoints
+
+Partial only; P1.3c and V11 acceptance remain open. `enqueueScoreTask` now requires exactly one returned row with a saved job ID equal to the actual PgBoss send ID, case-insensitively. A disposable PostgreSQL trigger substituting a different valid UUID demonstrated the previous bug: the focused test resolved successfully instead of rejecting. After the fix, the real PgBoss job and admission/supersession writes roll back. This proves the existing `ScoreAdmission` caller only, not tag release.
+
+The real-admission characterization `tests/integration/article-jobs.test.ts` shows that a waiting score task's primary key can be changed while every other field and the root metadata remain unchanged. This observation is not a blocker: the clarified contract treats precreated score rows and persisted linkage as snapshot authority and does not require independent score-PK proof against coherent direct database rewrites. Root `tagsTaskId` and `targetCount`, strict linkage, same article/action, distinct nonnull targets, count and eligibility checks remain required. No membership digest, schema or migration is authorized. Linked tag publication remains guarded; no producer/release implementation or worker/provider activation was added.
+
+`ArticleJobs` now delegates standalone tag publication and tag-key validation to `CatalogStore`; linked and malformed-namespace work remains rejected. With Node 24.21.0, disposable PostgreSQL and fake AI, `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/assign-tags.test.ts` passed 85 tests, including standalone generation-zero/one publication and linked-guard checks. `mise exec node@24.21.0 -- npm run typecheck`, scoped ESLint on `src/server/adapters/postgres/article-jobs.ts` and `tests/integration/assign-tags.test.ts`, and `git diff --check` passed. This is not producer or V11 acceptance.
+
+Node 24.21.0, disposable PostgreSQL 18 and real PgBoss:
+
+- `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/score-admission.test.ts -t 'different valid persisted job ID'`: failed before the fix because admission resolved; `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/score-admission.test.ts` passed 14 tests after it.
+- `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-jobs.test.ts -t 'score identity is not independently anchored'`: 1 passed, 85 skipped; characterization, not producer acceptance.
+- V11c command: `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/article-jobs.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts` passed 5 files / 294 tests. Required producer-to-score, release rollback and race cases are absent, so this is not V11c acceptance.
+- Aggregate V11 command: `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/article-handoff.test.ts tests/unit/process-context-chunks.test.ts tests/integration/article-jobs.test.ts tests/integration/assign-tags.test.ts tests/integration/assign-tags-races.test.ts tests/integration/score-task-input.test.ts tests/integration/run-stored-score-task.test.ts tests/integration/score-admission.test.ts tests/integration/enrichment.test.ts` passed 9 files / 464 tests. This is a preservation run, not aggregate P1.3 acceptance.
+- `mise exec node@24.21.0 -- npm run typecheck` and `mise exec node@24.21.0 -- ./node_modules/.bin/eslint src/server/adapters/postgres/score-admission.ts tests/integration/score-admission.test.ts tests/integration/article-jobs.test.ts` passed. Build, full lint and full test suite not run for this checkpoint.
 
 ## C14/C15 — read-only saved score results
 

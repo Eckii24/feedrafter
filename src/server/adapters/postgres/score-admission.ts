@@ -20,9 +20,9 @@ export async function enqueueScoreTask(tx: Transaction, boss: PgBoss, taskId: st
     db: fromDrizzle(tx, sql), retryLimit: 0,
   });
   if (!jobId || !uuid.test(jobId)) throw new Error('Score job was not enqueued');
-  const [saved] = await tx.update(processingTasks).set({ jobId }).where(eq(processingTasks.id, taskId)).returning();
-  if (!saved) throw new Error('Score job ID update failed');
-  return saved;
+  const saved = await tx.update(processingTasks).set({ jobId }).where(eq(processingTasks.id, taskId)).returning();
+  if (saved.length !== 1 || saved[0]?.jobId?.toLowerCase() !== jobId.toLowerCase()) throw new Error('Score job ID update failed');
+  return saved[0];
 }
 
 export class ScoreAdmission {

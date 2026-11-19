@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createUsageDatabase } from '../helpers/usage-database.js';
+import { linkedScoreFixture } from '../helpers/linked-score-fixture.js';
 import { migrateDatabase } from '../../src/server/adapters/postgres/migrate.js';
 import { ScoreTaskInputStore } from '../../src/server/adapters/postgres/score-task-input-store.js';
 import { ContentStore } from '../../src/server/adapters/postgres/content-store.js';
@@ -15,7 +16,7 @@ import type { AiPort } from '../../src/server/ports/ai.js';
 
 let db: Awaited<ReturnType<typeof createUsageDatabase>>;
 let store: ScoreTaskInputStore;
-let article: string, other: string, source: string, tag: string, task: string, token: string;
+let article: string, other: string, source: string, tag: string, task: string, token: string, context: string;
 const score = '10000000-0000-4000-8000-000000000001';
 const category = '00000000-0000-4000-8000-000000000002';
 const classifier = { model: { provider: 'fake', model: 'classifier' }, limits: { contextTokens: 10000, outputTokens: 100, framingTokens: 1 }, countTokens: () => 1 };
@@ -28,7 +29,7 @@ beforeAll(async () => {
   db = await createUsageDatabase();
   await migrateDatabase(db.pool);
   store = new ScoreTaskInputStore(db.pool);
-  const context = (await db.pool.query("insert into import_contexts(instance,account) values ('score-input','test') returning id")).rows[0].id;
+  context = (await db.pool.query("insert into import_contexts(instance,account) values ('score-input','test') returning id")).rows[0].id;
   source = (await db.pool.query("insert into sources(context_id,external_feed_id,manual_offset) values ($1,'feed',2) returning id", [context])).rows[0].id;
   article = (await db.pool.query("insert into articles(context_id,freshrss_id,source_id,category_id,title,imported_at) values ($1,'one',$2,$3,'Title',now()) returning id", [context, source, category])).rows[0].id;
   other = (await db.pool.query("insert into articles(context_id,freshrss_id,source_id,imported_at) values ($1,'two',$2,now()) returning id", [context, source])).rows[0].id;
@@ -46,6 +47,20 @@ beforeAll(async () => {
   task = (await db.pool.query("insert into processing_tasks(article_id,action,score_target_id,generation,state,execution_token,created_at,updated_at) values ($1,'scores',$2,3,'running',$3,now(),now()) returning id", [article, score, token])).rows[0].id;
 }, 30000);
 afterAll(async () => { if (db) await db.dispose(); });
+
+it('consumer-only loader, kernel and publisher preserve real receipt linkage', async () => {
+  const f = await linkedScoreFixture(db, context, score, new Date());
+  const executionToken = randomUUID(); await f.tasks.claimTask(f.score.id, executionToken, new Date());
+  const loaded = await store.loadResult(f.score.id, executionToken, models, signal);
+  if (loaded.kind !== 'loaded') throw new Error(`linked score input: ${loaded.kind}`);
+  expect(loaded.input.owner.handoff).toMatchObject({ root: f.root, consumer: f.consumer, receipt: f.tagReceipt });
+  const ai = { classify: async () => ({ kind: 'completed' as const, value: { answers: { score: { type: 'score' as const, score: 4, confidence: 1, criteria: [] } }, usage: null } }), generate: async () => { throw new Error('unexpected generator'); }, createRestrictedSession: async () => { throw new Error('unexpected session'); } };
+  const candidate = await processContextChunks(loaded.input, ai);
+  if (candidate.kind !== 'completed') throw new Error(`linked score kernel: ${candidate.kind}`);
+  expect(candidate.value.basis.handoff).toEqual(loaded.input.owner.handoff);
+  expect(await new ScoreStore(db.db).publishCandidate(candidate.value, new Date())).toBe(true);
+  expect(await new ScoreStore(db.db).get(f.article, score)).toMatchObject({ value: 100 });
+});
 
 it('captures override, selected fields, real weights at one instant, and fenced basis', async () => {
   const input = await load();

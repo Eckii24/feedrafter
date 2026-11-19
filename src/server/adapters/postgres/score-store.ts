@@ -1,8 +1,10 @@
 import { eq, and, gt } from "drizzle-orm";
+import { isDeepStrictEqual } from 'node:util';
+import { captureScoreHandoff } from './score-handoff.js';
 import type { ScoreCandidate } from "../../application/process-context-chunks.js";
 import { validateScore } from "../../domain/enrichment.js";
 import type { Database } from "./client.js";
-import { articleScores, catalogEpoch, scoreDefinitions } from "./schema/enrichment.js";
+import { articleContents, articleScores, catalogEpoch, scoreDefinitions } from "./schema/enrichment.js";
 import { articles } from "./schema/import.js";
 import { processingTasks } from "./schema/processing.js";
 
@@ -60,6 +62,13 @@ export class ScoreStore {
       const [task] = await tx.select().from(processingTasks).where(eq(processingTasks.id, basis.taskId)).for('update');
       if (!task || task.articleId !== article.id || task.action !== 'scores' || task.scoreTargetId !== definition.id ||
           task.state !== 'running' || task.executionToken !== basis.executionToken.toLowerCase() || task.generation !== basis.generation) return false;
+      const handoff = await captureScoreHandoff(task, article, {
+        task: async id => (await tx.select().from(processingTasks).where(eq(processingTasks.id, id)).for('share'))[0] ?? null,
+        newer: async (articleId, action, generation) => !!(await tx.select({ id: processingTasks.id }).from(processingTasks).where(and(eq(processingTasks.articleId, articleId), eq(processingTasks.action, action), gt(processingTasks.generation, generation))).limit(1))[0],
+        content: async articleId => (await tx.select({ text: articleContents.text, revision: articleContents.revision }).from(articleContents).where(eq(articleContents.articleId, articleId)).for('share'))[0] ?? null,
+      });
+      if (handoff.kind === 'root' ? basis.handoff !== undefined :
+          handoff.kind !== 'linked' || !isDeepStrictEqual(basis.handoff, handoff.value)) return false;
       const [newer] = await tx.select({ id: processingTasks.id }).from(processingTasks).where(and(
         eq(processingTasks.articleId, article.id), eq(processingTasks.action, 'scores'), eq(processingTasks.scoreTargetId, definition.id),
         gt(processingTasks.generation, basis.generation),

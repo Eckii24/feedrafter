@@ -62,6 +62,7 @@ describe('article preparation', () => {
     expect((await f.run({ permission: true })).status).toBe('succeeded');
     expect(f.permission.resolveForArticle).toHaveBeenCalledWith(context.articleId, 'example.com');
     expect(f.classifier.classify).toHaveBeenCalledTimes(3);
+    for (const call of vi.mocked(f.classifier.classify).mock.calls) expect(call[2]).toBe(context.taskId);
     expect(f.publications[1]).toMatchObject({ kind: 'success', content: { limitation: 'fallback; quality is heuristic' } });
   });
   it.each([false, null])('denies fallback for permission %s', async decision => {

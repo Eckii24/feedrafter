@@ -83,7 +83,7 @@ export async function buildHttpApp(deps: HttpDependencies) {
     const snapshot = JSON.stringify(result.rows); if (lastRun && snapshot !== lastRun) broadcast('pipeline.changed', 'runs'); lastRun = snapshot;
   }).catch(() => {}); }, 2000); progress.unref();
   let lastTasks = new Map<string, string>();
-  const taskProgress = setInterval(() => { void deps.pool.query<{ id: string; state: string; updated_at: Date }>("select id, state, updated_at from processing_tasks where action = 'scores' order by updated_at desc, id desc limit 100").then(result => {
+  const taskProgress = setInterval(() => { void deps.pool.query<{ id: string; state: string; updated_at: Date }>("select id, state, updated_at from processing_tasks where action in ('category', 'tags', 'scores') order by updated_at desc, id desc limit 100").then(result => {
     const next = new Map(result.rows.map(row => [row.id, `${row.state}:${row.updated_at.toISOString()}`]));
     for (const [id, value] of next) if (lastTasks.get(id) !== value) broadcast('task.changed', id);
     lastTasks = next;
@@ -241,11 +241,11 @@ export async function buildHttpApp(deps: HttpDependencies) {
   });
   app.get<{ Params: { id: string } }>('/api/v1/processing-tasks/:id', { schema: { params: idParams, response: { 200: { oneOf: [
     { type: 'object', required: ['id', 'articleId', 'action', 'state', 'outcome', 'bookmarkId', 'nextStep'], properties: { id: uuid, articleId: uuid, action: { const: 'karakeep' }, state: { type: 'string' }, outcome: nullableString, bookmarkId: nullableString, nextStep: nullableString } },
-    { type: 'object', required: ['id', 'articleId', 'action', 'scoreTargetId', 'generation', 'state', 'errorCode', 'createdAt', 'updatedAt', 'endedAt'], properties: { id: uuid, articleId: uuid, action: { const: 'scores' }, scoreTargetId: { type: ['string', 'null'] }, generation: { type: 'integer' }, state: { type: 'string' }, errorCode: nullableString, createdAt: { type: 'string' }, updatedAt: { type: 'string' }, endedAt: nullableString } },
+    ...(['category', 'tags', 'scores'] as const).map(action => ({ type: 'object', required: ['id', 'articleId', 'action', 'scoreTargetId', 'generation', 'state', 'errorCode', 'createdAt', 'updatedAt', 'endedAt'], properties: { id: uuid, articleId: uuid, action: { const: action }, scoreTargetId: action === 'scores' ? { type: ['string', 'null'] } : { type: 'null' }, generation: { type: 'integer' }, state: { type: 'string' }, errorCode: nullableString, createdAt: { type: 'string' }, updatedAt: { type: 'string' }, endedAt: nullableString } })),
   ] }, ...commonResponses } } }, async (request, reply) => {
     const task = await tasks.getTask(request.params.id);
-    if (!task || !['karakeep', 'scores'].includes(task.action)) return reply.code(404).send(notFound(request.id));
-    if (task.action === 'scores') return { id: task.id, articleId: task.articleId, action: task.action, scoreTargetId: task.scoreTargetId, generation: task.generation, state: task.state, errorCode: task.errorCode, createdAt: task.createdAt.toISOString(), updatedAt: task.updatedAt.toISOString(), endedAt: task.endedAt?.toISOString() ?? null };
+    if (!task || !['karakeep', 'category', 'tags', 'scores'].includes(task.action)) return reply.code(404).send(notFound(request.id));
+    if (task.action !== 'karakeep') return { id: task.id, articleId: task.articleId, action: task.action, scoreTargetId: task.action === 'scores' ? task.scoreTargetId : null, generation: task.generation, state: task.state, errorCode: task.errorCode, createdAt: task.createdAt.toISOString(), updatedAt: task.updatedAt.toISOString(), endedAt: task.endedAt?.toISOString() ?? null };
     return { id: task.id, articleId: task.articleId, action: task.action, state: task.state, outcome: typeof task.result?.outcome === 'string' ? task.result.outcome : null, bookmarkId: typeof task.result?.bookmarkId === 'string' ? task.result.bookmarkId : null, nextStep: task.state === 'needs_input' ? 'Check Karakeep manually before taking further action; this request will not be retried automatically.' : task.state === 'paused_auth' ? 'Repair Karakeep credentials and restart the worker to resume.' : null };
   });
   app.post<{ Body: { targetId: string; sourceIds: string[] } }>('/api/v1/tags/merge', { schema: { body: { type: 'object', additionalProperties: false, required: ['targetId', 'sourceIds'], properties: { targetId: uuid, sourceIds: { type: 'array', minItems: 1, maxItems: 100, items: uuid } } }, response: { 200: { type: 'object', required: ['ok'], properties: { ok: { const: true } } }, 409: errorSchema, 500: errorSchema, ...commonResponses } } }, async (request, reply) => {

@@ -3,6 +3,7 @@ import { processContextChunks, type ScoreContextTask } from '../../src/server/ap
 import { UsageAttemptError } from '../../src/server/application/usage.js';
 import type { AiPort, ClassificationRequest } from '../../src/server/ports/ai.js';
 import type { ContextStore } from '../../src/server/adapters/postgres/context-store.js';
+import type { ScoreHandoff } from '../../src/server/adapters/postgres/score-handoff.js';
 import { prepareContext } from '../../src/server/application/prepare-context.js';
 
 const count = (s: string) => Buffer.byteLength(s, 'utf8');
@@ -143,6 +144,18 @@ describe('direct score candidate subset', () => {
       return { kind: 'completed', value: { answers: { score: { type: 'score', score: 4, confidence: 1, criteria: ['0', '25', '50', '75', '100'] } }, usage: null } };
     });
     expect(await processContextChunks(input, ai)).toMatchObject({ kind: 'completed', value: { basis: { assignmentRevision: 2, contentRevision: 1, catalogEpoch: 7 } } });
+  });
+  it('snapshots nested linked handoff before inference without leaking it into selected fields', async () => {
+    const basis = { contentRevision: 1, assignmentRevision: 2, articleInputHash: 'a'.repeat(64) };
+    const root = { version: 1 as const, rootTaskId: 'root', prepareTaskId: 'prepare', tagsTaskId: 'tags', requiredHandoff: null, requiredBasis: basis, targetCount: 1 };
+    const tags = { version: 1 as const, rootTaskId: 'root', prepareTaskId: 'prepare', requiredHandoff: { taskId: 'root', generation: 1, action: 'category' as const }, requiredBasis: basis };
+    const consumer = { version: 1 as const, rootTaskId: 'root', prepareTaskId: 'prepare', requiredHandoff: { taskId: 'tags', generation: 1, action: 'tags' as const }, requiredBasis: basis };
+    const receipt = { version: 1 as const, taskId: 'tags', generation: 1, action: 'tags' as const, articleId: 'article', prerequisiteId: 'root', categoryId: 'category', basis, catalogEpoch: 1 };
+    const handoff: ScoreHandoff = { root, tags, consumer, receipt, categoryReceipt: { ...receipt, action: 'category', taskId: 'root', prerequisiteId: 'prepare' }, preparationReceipt: { version: 1, action: 'prepare', taskId: 'prepare', articleId: 'article', generation: 1, contentRevision: 1 }, articleInputHash: basis.articleInputHash, contentText: 'secret' };
+    const expected = structuredClone(handoff), input = task(), ai = fake(1.5);
+    ai.classify.mockImplementationOnce(async () => { basis.assignmentRevision = 99; consumer.requiredHandoff.generation = 9; receipt.catalogEpoch = 99; return { kind: 'completed', value: { answers: { score: { type: 'score', score: 1.5, confidence: 1, criteria: [] } }, usage: null } }; });
+    expect(await processContextChunks({ ...input, owner: { ...input.owner, handoff } }, ai)).toMatchObject({ kind: 'completed', value: { value: 37.5, basis: { handoff: expected } } });
+    expect(ai.classify.mock.calls[0]![0].state).toEqual({ title: 'Title' });
   });
   it.each([-1, 1.5, NaN, 2147483648])('rejects invalid captured epoch %s before dispatch', async catalogEpoch => {
     const input = task(), ai = fake();

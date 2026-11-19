@@ -10,9 +10,14 @@ import { ArticleJobs } from '../../src/server/adapters/postgres/article-jobs.js'
 import { ContentStore } from '../../src/server/adapters/postgres/content-store.js';
 import { TaskStore } from '../../src/server/adapters/postgres/task-store.js';
 import { CategoryTaskInputStore } from '../../src/server/adapters/postgres/category-task-input-store.js';
+import { TagTaskInputStore } from '../../src/server/adapters/postgres/tag-task-input-store.js';
+import { ScoreTaskInputStore } from '../../src/server/adapters/postgres/score-task-input-store.js';
 import { CatalogStore } from '../../src/server/adapters/postgres/catalog-store.js';
 import { ScoreStore } from '../../src/server/adapters/postgres/score-store.js';
+import { ScoreAdmission } from '../../src/server/adapters/postgres/score-admission.js';
 import { categorize } from '../../src/server/application/categorize.js';
+import { assignTags } from '../../src/server/application/assign-tags.js';
+import { runStoredScoreTask } from '../../src/server/application/run-stored-score-task.js';
 import type { AiPort } from '../../src/server/ports/ai.js';
 import { articleFingerprint, readChainMetadata, readHandoffReceipt } from '../../src/server/domain/article-handoff.js';
 import { fallbackCategoryId } from '../../src/shared/taxonomy.js';
@@ -42,6 +47,7 @@ beforeAll(async () => {
   boss = new PgBoss({ connectionString: url }); boss.on('error', () => {}); await boss.start();
   await boss.createQueue('category');
   await boss.createQueue('tags');
+  await boss.createQueue('score');
   admission = new ArticleJobs(database.db, boss);
 }, 30000);
 
@@ -93,6 +99,21 @@ it.each([['catalog', 0], ['catalog', 1], ['article jobs', 0], ['article jobs', 1
     expect((await database.pool.query("select id from pgboss.job where name='tags'")).rows).toEqual([]);
     expect((await database.pool.query('select category_id,assignment_revision from articles where id=$1', [id])).rows[0]).toEqual({ category_id: categoryId, assignment_revision: changed ? 1 : 0 });
   }
+});
+
+it('characterizes that admitted score identity is not independently anchored', async () => {
+  const result = await admission.admitPreparedArticle(article, prepare, at);
+  if (result.kind !== 'admitted') throw new Error('admission failed');
+  const original = result.scoreTaskIds[0]!;
+  const replacement = randomUUID();
+  const rootBefore = (await database.pool.query('select result from processing_tasks where id=$1', [result.categoryTaskId])).rows[0];
+  const before = (await database.pool.query('select * from processing_tasks where id=$1', [original])).rows[0];
+  await database.pool.query('update processing_tasks set id=$2 where id=$1', [original, replacement]);
+  const after = (await database.pool.query('select * from processing_tasks where id=$1', [replacement])).rows[0];
+  expect(after).toEqual({ ...before, id: replacement });
+  expect((await database.pool.query('select result from processing_tasks where id=$1', [result.categoryTaskId])).rows[0]).toEqual(rootBefore);
+  expect((await database.pool.query('select id from processing_tasks where id=$1', [original])).rows).toEqual([]);
+  expect(readChainMetadata(rootBefore.result, 'category')).toMatchObject({ targetCount: result.scoreTaskIds.length, tagsTaskId: result.tagsTaskId });
 });
 
 it('publishes a standalone category task at the permitted generation zero', async () => {
@@ -482,6 +503,319 @@ async function categoryRun(admitted: Awaited<ReturnType<typeof admit>>, during?:
     signal: new AbortController().signal, now: () => at });
   return { result, classify };
 }
+it('releases admitted scores through real tag and score kernels', async () => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const previousAssignment = (await articleRow()).assignment_revision;
+  const previousEpoch = (await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision;
+  const tasks = new TaskStore(database.db);
+  const token = randomUUID();
+  expect(await tasks.claimTaskForAction(admitted.tagsTaskId, 'tags', token, at)).toBeTruthy();
+  await database.pool.query("update model_roles set provider='fake',model='tags' where role='tags'");
+  const model = { model: { provider: 'fake', model: 'tags' }, limits: { contextTokens: 10000, outputTokens: 100, framingTokens: 1 }, countTokens: () => 1 };
+  const ai: AiPort = { classify: vi.fn().mockResolvedValue({ kind: 'completed', value: { answers: { score: { type: 'score', score: 3, confidence: 1, criteria: [] } }, usage: null } }), generate: vi.fn().mockResolvedValue({ kind: 'completed', value: { text: '{"tags":["new label"]}', usage: null } }), createRestrictedSession: vi.fn() };
+  expect(await assignTags(admitted.tagsTaskId, token, { inputs: new TagTaskInputStore(database.pool), catalog: admission, tasks, ai, model, signal: new AbortController().signal, now: () => at })).toEqual({ kind: 'published' });
+  const receipt = readHandoffReceipt((await tasks.getTask(admitted.tagsTaskId))?.result);
+  expect(receipt).toMatchObject({ taskId: admitted.tagsTaskId, action: 'tags', basis: { assignmentRevision: previousAssignment + 1 }, catalogEpoch: previousEpoch + 1 });
+  const queued = (await rows()).filter(row => admitted.scoreTaskIds.includes(row.id));
+  expect(queued).toHaveLength(2);
+  const scoreJobs = (await database.pool.query("select id,data from pgboss.job where name='score'")).rows;
+  expect(scoreJobs).toHaveLength(2);
+  for (const task of queued) {
+    expect(task.state).toBe('queued');
+    expect(readChainMetadata(task.result, 'scores')?.requiredBasis).toEqual(receipt?.basis);
+    expect(scoreJobs).toContainEqual({ id: task.job_id, data: { taskId: task.id } });
+  }
+  await database.pool.query("update model_roles set provider='fake',model=case role when 'scores' then 'classifier' else 'generator' end where role in ('scores','context_reduction')");
+  const classifier = { ...model, model: { provider: 'fake', model: 'classifier' } };
+  const generator = { ...model, model: { provider: 'fake', model: 'generator' } };
+  for (const id of admitted.scoreTaskIds) {
+    expect(await runStoredScoreTask(id, { ai, inputs: new ScoreTaskInputStore(database.pool), scores: new ScoreStore(database.db), tasks, models: { classifier, generator }, signal: new AbortController().signal, now: () => at })).toEqual({ kind: 'published' });
+  }
+  expect(ai.classify).toHaveBeenCalledTimes(2);
+  for (const target of targets) expect(await new ScoreStore(database.db).get(article, target)).toMatchObject({ value: 75 });
+});
+
+async function linkedTagRun(admitted: Awaited<ReturnType<typeof admit>>, labels = ['release-new'], during?: () => Promise<void>, publisher: Pick<ArticleJobs, 'publishTagCandidate' | 'tagKeysFit'> = admission) {
+  const tasks = new TaskStore(database.db), token = randomUUID();
+  expect(await tasks.claimTaskForAction(admitted.tagsTaskId, 'tags', token, at)).toBeTruthy();
+  await database.pool.query("update model_roles set provider='fake',model='tags' where role='tags'");
+  const model = { model: { provider: 'fake', model: 'tags' }, limits: { contextTokens: 10000, outputTokens: 100, framingTokens: 1 }, countTokens: () => 1 };
+  const ai: AiPort = { classify: vi.fn(), generate: vi.fn().mockImplementation(async () => { if (during) await during(); return { kind: 'completed', value: { text: JSON.stringify({ tags: labels }), usage: null } }; }), createRestrictedSession: vi.fn() };
+  return assignTags(admitted.tagsTaskId, token, { inputs: new TagTaskInputStore(database.pool), catalog: publisher, tasks, ai, model, signal: new AbortController().signal, now: () => at });
+}
+async function releaseSnapshot() {
+  return { tasks: await rows(), article: await articleRow(), epoch: (await database.pool.query('select * from catalog_epoch')).rows,
+    tags: (await database.pool.query('select * from tags order by id')).rows,
+    associations: (await database.pool.query('select * from article_tags where article_id=$1 order by tag_id', [article])).rows,
+    scores: (await database.pool.query('select * from article_scores where article_id=$1 order by score_id', [article])).rows,
+    jobs: (await database.pool.query('select id,name,data from pgboss.job order by id')).rows };
+}
+
+it('keeps an empty snapshot empty after a score definition is added', async () => {
+  await database.pool.query('update score_definitions set active=false');
+  const admitted = await admit();
+  expect(admitted.scoreTaskIds).toEqual([]);
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  await database.pool.query("insert into score_definitions(name,description,prompt) values ('late','','prompt')");
+  expect(await linkedTagRun(admitted, [])).toEqual({ kind: 'published' });
+  expect((await rows()).filter(row => row.action === 'scores')).toEqual([]);
+  expect((await database.pool.query("select id from pgboss.job where name='score'")).rows).toEqual([]);
+  expect(readHandoffReceipt((await rows()).find(row => row.id === admitted.tagsTaskId).result)).toMatchObject({ action: 'tags' });
+});
+
+it('retires unavailable and newer targets independently and preserves terminal siblings', async () => {
+  await database.pool.query("insert into score_definitions(name,description,prompt) values ('third','','prompt'),('fourth','','prompt')");
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const scores = (await rows()).filter(row => admitted.scoreTaskIds.includes(row.id)).sort((a, b) => a.id.localeCompare(b.id));
+  await database.pool.query('update score_definitions set active=false where id=$1', [scores[0].score_target_id]);
+  await database.pool.query("insert into processing_tasks(article_id,action,score_target_id,generation,state,created_at,updated_at) values ($1,'scores',$2,2,'failed',$3,$3)", [article, scores[1].score_target_id, at]);
+  await database.pool.query("update processing_tasks set state='failed',error_code='preserve' where id=$1", [scores[2].id]);
+  const terminal = (await rows()).find(row => row.id === scores[2].id);
+  expect(await linkedTagRun(admitted, [])).toEqual({ kind: 'published' });
+  const after = await rows();
+  expect(after.find(row => row.id === scores[0].id)).toMatchObject({ state: 'superseded', error_code: 'target_unavailable', job_id: null });
+  expect(after.find(row => row.id === scores[1].id)).toMatchObject({ state: 'superseded', error_code: 'newer_generation', job_id: null });
+  expect(after.find(row => row.id === scores[2].id)).toEqual(terminal);
+  expect(after.find(row => row.id === scores[3].id)).toMatchObject({ state: 'queued' });
+  expect((await database.pool.query("select data from pgboss.job where name='score'")).rows).toEqual([{ data: { taskId: scores[3].id } }]);
+});
+
+it('preserves a superseded original when explicit score admission creates a newer generation', async () => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  await database.pool.query('update score_definitions set active=false where id=$1', [targets[1]]);
+  const explicit = await new ScoreAdmission(database.db, boss).admit(article, at);
+  expect(explicit.result).toBe('ok');
+  await database.pool.query('update score_definitions set active=true where id=$1', [targets[1]]);
+  const before = (await rows()).find(row => row.score_target_id === targets[0] && admitted.scoreTaskIds.includes(row.id));
+  expect(before.state).toBe('superseded');
+  expect(await linkedTagRun(admitted, [])).toEqual({ kind: 'published' });
+  const after = await rows();
+  expect(after.find(row => row.id === before.id)).toEqual(before);
+  expect(after.find(row => row.score_target_id === targets[1] && admitted.scoreTaskIds.includes(row.id))).toMatchObject({ state: 'queued' });
+  expect((await database.pool.query("select id from pgboss.job where name='score'")).rows).toHaveLength(2);
+});
+
+it.each(['second send', 'null', 'invalid', 'update', 'wrong uuid', 'commit'])('rolls back the entire tag release on %s failure', async failure => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  await database.pool.query('insert into article_scores(article_id,score_id,value,calculated_at,content_revision,assignment_revision) values ($1,$2,42,$3,0,0)', [article, targets[0], at]);
+  const send = boss.send.bind(boss);
+  let count = 0;
+  vi.spyOn(boss, 'send').mockImplementation(async (...args) => {
+    if (args[0] !== 'score') return send(...args);
+    count++;
+    if (failure === 'second send' && count === 2) throw new Error('second send failure');
+    const id = await send(...args);
+    return failure === 'null' ? null : failure === 'invalid' ? 'invalid' : id;
+  });
+  if (failure === 'update' || failure === 'wrong uuid') {
+    await database.pool.query(`create function reject_score_release_id() returns trigger language plpgsql as $$ begin if new.id = '${admitted.scoreTaskIds[0]}'::uuid and old.job_id is null and new.job_id is not null then ${failure === 'update' ? 'return null;' : `new.job_id := '${randomUUID()}'::uuid;`} end if; return new; end $$`);
+    await database.pool.query('create trigger reject_score_release_id before update on processing_tasks for each row execute function reject_score_release_id()');
+  }
+  if (failure === 'commit') {
+    await database.pool.query(`create function reject_tag_release_commit() returns trigger language plpgsql as $$ begin if new.id = '${admitted.tagsTaskId}'::uuid and new.state = 'succeeded' then raise exception 'commit failure'; end if; return null; end $$`);
+    await database.pool.query('create constraint trigger reject_tag_release_commit after update on processing_tasks deferrable initially deferred for each row execute function reject_tag_release_commit()');
+  }
+  let before: Awaited<ReturnType<typeof releaseSnapshot>> | undefined;
+  try {
+    await expect(linkedTagRun(admitted, ['rollback-new'], async () => { before = await releaseSnapshot(); })).rejects.toThrow('Tag publication failed');
+    expect(await releaseSnapshot()).toEqual(before);
+  } finally {
+    if (failure === 'update' || failure === 'wrong uuid') await database.pool.query('drop trigger reject_score_release_id on processing_tasks; drop function reject_score_release_id()');
+    if (failure === 'commit') await database.pool.query('drop trigger reject_tag_release_commit on processing_tasks; drop function reject_tag_release_commit()');
+  }
+});
+
+it('rolls back retirement and a later sibling enqueue when tag release fails at commit', async () => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const scores = (await rows()).filter(row => admitted.scoreTaskIds.includes(row.id));
+  const [unavailable, eligible] = scores;
+  expect(scores).toHaveLength(2);
+  await database.pool.query('update score_definitions set active=false where id=$1', [unavailable.score_target_id]);
+  const earlier = new Date('2025-01-01T00:00:00Z');
+  await database.pool.query("update processing_tasks set error_code='prior_error',updated_at=$2 where id=$1", [unavailable.id, earlier]);
+  await database.pool.query(`create function reject_retirement_commit() returns trigger language plpgsql as $$
+    begin
+      if new.id = '${admitted.tagsTaskId}'::uuid and new.state = 'succeeded' then
+        if not exists (select 1 from processing_tasks where id='${unavailable.id}'::uuid and state='superseded' and error_code='target_unavailable' and updated_at='${at.toISOString()}' and ended_at='${at.toISOString()}')
+          or not exists (select 1 from processing_tasks s join pgboss.job j on j.id=s.job_id where s.id='${eligible.id}'::uuid and s.state='queued' and j.name='score' and j.data->>'taskId'=s.id::text)
+        then raise exception 'retirement or enqueue missing'; end if;
+        raise exception 'verified retirement and enqueue before commit failure';
+      end if;
+      return null;
+    end $$`);
+  await database.pool.query('create constraint trigger reject_retirement_commit after update on processing_tasks deferrable initially deferred for each row execute function reject_retirement_commit()');
+  let before: Awaited<ReturnType<typeof releaseSnapshot>> | undefined;
+  let publicationError: unknown;
+  const publisher = {
+    tagKeysFit: admission.tagKeysFit.bind(admission),
+    publishTagCandidate: async (...args: Parameters<ArticleJobs['publishTagCandidate']>) => {
+      try { return await admission.publishTagCandidate(...args); }
+      catch (error) { publicationError = error; throw error; }
+    },
+  };
+  try {
+    await expect(linkedTagRun(admitted, ['retirement-rollback'], async () => { before = await releaseSnapshot(); }, publisher)).rejects.toThrow('Tag publication failed');
+    expect(publicationError).toMatchObject({ cause: { message: 'verified retirement and enqueue before commit failure' } });
+    const after = await releaseSnapshot();
+    expect(after).toEqual(before);
+    expect(after.tasks.find(row => row.id === unavailable.id)).toMatchObject({ state: 'waiting_dependency', error_code: 'prior_error', updated_at: earlier, ended_at: null, job_id: null });
+    expect(after.tasks.find(row => row.id === eligible.id)).toEqual(before!.tasks.find(row => row.id === eligible.id));
+    expect(readHandoffReceipt(after.tasks.find(row => row.id === admitted.tagsTaskId).result)).toBeNull();
+    expect(after.jobs.filter(job => job.name === 'score')).toEqual([]);
+  } finally {
+    await database.pool.query('drop trigger reject_retirement_commit on processing_tasks; drop function reject_retirement_commit()');
+  }
+});
+
+it.each(['empty', 'existing'])('publishes %s tags with the exact unchanged assignment and epoch', async mode => {
+  if (mode === 'existing') {
+    const catalog = new CatalogStore(database.db);
+    const tag = await catalog.createTag(`existing-${randomUUID()}`);
+    expect(await catalog.attachTag(article, tag.id)).toBe(true);
+  }
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const before = await articleRow();
+  const epoch = (await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision;
+  const labels = mode === 'empty' ? [] : [(await new CatalogStore(database.db).listArticleTags(article))[0]!.label];
+  expect(await linkedTagRun(admitted, labels)).toEqual({ kind: 'published' });
+  const receipt = readHandoffReceipt((await rows()).find(row => row.id === admitted.tagsTaskId).result);
+  expect(receipt).toMatchObject({ basis: { assignmentRevision: before.assignment_revision }, catalogEpoch: epoch });
+  expect((await articleRow()).assignment_revision).toBe(before.assignment_revision);
+});
+
+it.each(['missing score', 'wrong prerequisite', 'malformed link', 'zero score reference', 'zero tag reference', 'missing preparation receipt', 'missing category receipt', 'newer prepare', 'newer category', 'newer tags', 'count', 'root anchor'])('rejects %s changed during tag inference without releasing scores', async change => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  let before: Awaited<ReturnType<typeof releaseSnapshot>> | undefined;
+  const result = await linkedTagRun(admitted, ['must-not-exist'], async () => {
+    const id = admitted.scoreTaskIds[0]!;
+    if (change === 'missing score') await database.pool.query('delete from processing_tasks where id=$1', [id]);
+    if (change === 'wrong prerequisite') await database.pool.query('update processing_tasks set prerequisite_id=$2 where id=$1', [id, admitted.categoryTaskId]);
+    if (change === 'malformed link') await database.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain}','null') where id=$1", [id]);
+    if (change === 'zero score reference' || change === 'zero tag reference') await database.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,requiredHandoff,generation}','0') where id=$1", [change === 'zero score reference' ? id : admitted.tagsTaskId]);
+    if (change === 'missing preparation receipt' || change === 'missing category receipt') await database.pool.query('update processing_tasks set result=result - $2::text where id=$1', [change === 'missing preparation receipt' ? prepare : admitted.categoryTaskId, change === 'missing preparation receipt' ? 'preparationReceipt' : 'handoffReceipt']);
+    if (change === 'newer prepare' || change === 'newer category' || change === 'newer tags') await database.pool.query("insert into processing_tasks(article_id,action,generation,state,created_at,updated_at) values ($1,$2,2,'failed',$3,$3)", [article, change.slice(6), at]);
+    if (change === 'count') await database.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,targetCount}','0') where id=$1", [admitted.categoryTaskId]);
+    if (change === 'root anchor') await database.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,tagsTaskId}',to_jsonb($2::text)) where id=$1", [admitted.categoryTaskId, randomUUID()]);
+    before = await releaseSnapshot();
+  });
+  expect(result).toEqual({ kind: 'superseded' });
+  const after = await releaseSnapshot();
+  expect(after.article).toEqual(before!.article); expect(after.epoch).toEqual(before!.epoch);
+  expect(after.tags).toEqual(before!.tags); expect(after.associations).toEqual(before!.associations);
+  expect(after.jobs).toEqual(before!.jobs); expect(after.scores).toEqual(before!.scores);
+  expect(after.tasks.filter(row => row.id !== admitted.tagsTaskId)).toEqual(before!.tasks.filter(row => row.id !== admitted.tagsTaskId));
+  const tagTask = after.tasks.find(row => row.id === admitted.tagsTaskId);
+  expect(tagTask).toMatchObject({ state: 'superseded', error_code: 'stale_basis' });
+  expect(readHandoffReceipt(tagTask.result)).toBeNull();
+});
+
+it('propagates an ambiguous committed tag release without settlement', async () => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const publisher = { tagKeysFit: admission.tagKeysFit.bind(admission), async publishTagCandidate(...args: Parameters<ArticleJobs['publishTagCandidate']>) {
+    expect(await admission.publishTagCandidate(...args)).toBeTruthy();
+    throw new Error('lost response');
+  } };
+  await expect(linkedTagRun(admitted, [], undefined, publisher)).rejects.toThrow('Tag publication failed');
+  const all = await rows();
+  expect(all.find(row => row.id === admitted.tagsTaskId)).toMatchObject({ state: 'succeeded', error_code: null });
+  expect(all.filter(row => admitted.scoreTaskIds.includes(row.id)).every(row => row.state === 'queued' && row.job_id)).toBe(true);
+  expect((await database.pool.query("select id from pgboss.job where name='score'")).rows).toHaveLength(2);
+});
+
+it('holds epoch, definition, article and task locks through score enqueue', async () => {
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const send = boss.send.bind(boss);
+  let checked = false;
+  vi.spyOn(boss, 'send').mockImplementation(async (...args) => {
+    const id = await send(...args);
+    if (args[0] === 'score' && !checked) {
+      checked = true;
+      const observer = await database.pool.connect();
+      try {
+        await observer.query('begin');
+        for (const [query, values] of [
+          ['select id from catalog_epoch where id=1 for update nowait', []],
+          ['select id from score_definitions where id=$1 for update nowait', [targets[0]]],
+          ['select id from articles where id=$1 for update nowait', [article]],
+          ['select id from processing_tasks where id=$1 for update nowait', [admitted.scoreTaskIds[0]]],
+        ] as [string, string[]][]) {
+          await observer.query('savepoint probe');
+          await expect(observer.query(query, values)).rejects.toMatchObject({ code: '55P03' });
+          await observer.query('rollback to savepoint probe');
+        }
+        await observer.query('rollback');
+      } finally { observer.release(); }
+    }
+    return id;
+  });
+  expect(await linkedTagRun(admitted)).toEqual({ kind: 'published' });
+  expect(checked).toBe(true);
+});
+
+it('retains publication locks at a deferred commit barrier', async () => {
+  const catalog = new CatalogStore(database.db);
+  const tag = await catalog.createTag(`barrier-${randomUUID()}`);
+  const admitted = await admit();
+  expect((await categoryRun(admitted)).result).toEqual({ kind: 'published' });
+  const holder = await database.pool.connect();
+  const observer = await database.pool.connect();
+  const key = 71492033;
+  let pid = 0;
+  const send = boss.send.bind(boss);
+  vi.spyOn(boss, 'send').mockImplementation(async (...args) => {
+    const id = await send(...args);
+    if (args[0] === 'score' && !pid) pid = (await args[2]!.db!.executeSql('select pg_backend_pid() as pid')).rows[0].pid as number;
+    return id;
+  });
+  await holder.query('select pg_advisory_lock($1)', [key]);
+  await database.pool.query(`create function hold_tag_release_commit() returns trigger language plpgsql as $$ begin if new.id = '${admitted.tagsTaskId}'::uuid and new.state = 'succeeded' then perform pg_advisory_xact_lock(${key}); end if; return null; end $$`);
+  await database.pool.query('create constraint trigger hold_tag_release_commit after update on processing_tasks deferrable initially deferred for each row execute function hold_tag_release_commit()');
+  let running: Promise<{ kind: string }> | undefined;
+  try {
+    running = linkedTagRun(admitted, [tag.label]);
+    let waiting = false;
+    for (let i = 0; i < 300 && !waiting; i++) {
+      if (pid) waiting = (await database.pool.query("select 1 from pg_stat_activity where pid=$1 and wait_event_type='Lock' and wait_event='advisory'", [pid])).rowCount === 1;
+      if (!waiting) await delay(10);
+    }
+    expect(waiting).toBe(true);
+    await observer.query('begin');
+    for (const [query, values] of [
+      ['select id from catalog_epoch where id=1 for update nowait', []],
+      ['select id from score_definitions where id=$1 for update nowait', [targets[0]]],
+      ['select id from tags where id=$1 for update nowait', [tag.id]],
+      ['select id from articles where id=$1 for update nowait', [article]],
+      ['select id from processing_tasks where id=$1 for update nowait', [admitted.tagsTaskId]],
+      ['select id from processing_tasks where id=$1 for update nowait', [admitted.scoreTaskIds[0]]],
+    ] as [string, unknown[]][]) {
+      await observer.query('savepoint probe');
+      await expect(observer.query(query, values)).rejects.toMatchObject({ code: '55P03' });
+      await observer.query('rollback to savepoint probe');
+    }
+    await observer.query('rollback');
+    expect((await database.pool.query("select id from pgboss.job where name='score'")).rows).toEqual([]);
+    await holder.query('select pg_advisory_unlock($1)', [key]);
+    expect(await running).toEqual({ kind: 'published' });
+    running = undefined;
+    expect((await database.pool.query("select id from pgboss.job where name='score'")).rows).toHaveLength(2);
+  } finally {
+    await observer.query('rollback');
+    await holder.query('select pg_advisory_unlock($1)', [key]);
+    if (running) await running.catch(() => {});
+    observer.release(); holder.release();
+    await database.pool.query('drop trigger hold_tag_release_commit on processing_tasks; drop function hold_tag_release_commit()');
+  }
+});
+
 async function tagJobs() { return (await database.pool.query("select id,data,retry_limit from pgboss.job where name='tags' order by id")).rows; }
 async function articleRow() { return (await database.pool.query('select category_id,assignment_revision,content_revision,title,source_id from articles where id=$1', [article])).rows[0]; }
 

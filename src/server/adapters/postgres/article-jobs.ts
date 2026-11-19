@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { and, eq, gt, inArray, isNull, sql } from 'drizzle-orm';
+import { and, eq, gt, inArray, isNull, or, sql } from 'drizzle-orm';
 import { fromDrizzle, type PgBoss } from 'pg-boss';
 import { articleFingerprint, decodeChainMetadataV1, decodeHandoffReceiptV1, readChainMetadata, readHandoffReceipt, readPreparationReceipt } from '../../domain/article-handoff.js';
-import { CatalogStore, type CategoryCandidate, type CategoryPublication } from './catalog-store.js';
+import { CatalogStore, RejectTagCandidate, type CategoryCandidate, type CategoryPublication, type TagCandidate, type TagPublication } from './catalog-store.js';
+import { enqueueScoreTask } from './score-admission.js';
 import type { Database } from './client.js';
 import { articleContents, articles, catalogEpoch, categories, processingTasks, scoreDefinitions } from './schema/index.js';
 
@@ -10,10 +11,110 @@ const unfinished = ['waiting_dependency', 'queued', 'running', 'retry_wait', 'pa
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const maxGeneration = 2147483647;
 class RejectCategoryHandoff extends Error {}
+class RejectTagHandoff extends Error {}
 
-/** Dormant admission and category handoff. Queue provisioning and workers are caller responsibilities. */
-export class ArticleJobs {
-  constructor(private readonly db: Database, private readonly boss: PgBoss) {}
+/** Dormant admission and atomic category/tag handoffs. Queue provisioning and workers are caller responsibilities. */
+export class ArticleJobs extends CatalogStore {
+  constructor(db: Database, private readonly boss: PgBoss) { super(db); }
+
+  tagKeysFit(labels: string[]) { return new CatalogStore(this.db).tagKeysFit(labels); }
+
+  async publishTagCandidate(candidate: TagCandidate, at: Date): Promise<TagPublication | null> {
+    if (!candidate || ![candidate.taskId, candidate.articleId, candidate.prerequisiteTaskId, candidate.categoryId].every(value => typeof value === 'string' && uuid.test(value))) return null;
+    try {
+      return await this.db.transaction(async tx => {
+        // Exclusive from the start: tag creation and release share this lock through commit.
+        const [epoch] = await tx.select().from(catalogEpoch).where(eq(catalogEpoch.id, 1)).for('update');
+        if (!epoch) throw new Error('Missing catalog epoch');
+        const definitions = await tx.select().from(scoreDefinitions).orderBy(scoreDefinitions.id).for('share');
+        await tx.select({ id: categories.id }).from(categories).where(eq(categories.id, candidate.categoryId)).for('share');
+        if (!await this.lockTagTargets(tx, candidate, at)) return null;
+        const [article] = await tx.select().from(articles).where(eq(articles.id, candidate.articleId)).for('update');
+        if (!article) return null;
+        // Fresh after article lock. Include rewired rows still pointing to this tags task.
+        const history = await tx.select().from(processingTasks).where(or(eq(processingTasks.articleId, article.id), eq(processingTasks.prerequisiteId, candidate.taskId)))
+          .orderBy(processingTasks.id).for('update');
+        const task = history.find(row => row.id === candidate.taskId.toLowerCase());
+        const category = history.find(row => row.id === candidate.prerequisiteTaskId.toLowerCase());
+        if (!task || !category) return null;
+        const chainPresent = Boolean(task.result && Object.hasOwn(task.result, 'articleChain')) || Boolean(category.result && Object.hasOwn(category.result, 'articleChain')) || Boolean(candidate.chainRoot || candidate.chainConsumer);
+        if (!chainPresent) return new CatalogStore(this.db).publishTagCandidateInTransaction(tx, candidate, at);
+        const root = readChainMetadata(category.result, 'category');
+        const tags = readChainMetadata(task.result, 'tags');
+        const categoryReceipt = readHandoffReceipt(category.result);
+        const prepare = root && history.find(row => row.id === root.prepareTaskId.toLowerCase());
+        const preparation = prepare && readPreparationReceipt(prepare.result);
+        if (!root || root.requiredHandoff !== null || !tags || !tags.requiredHandoff || !tags.requiredBasis || !categoryReceipt || !prepare || !preparation ||
+            task.articleId !== article.id || task.action !== 'tags' || task.state !== 'running' || task.generation < 1 || task.scoreTargetId !== null ||
+            category.articleId !== article.id || category.action !== 'category' || category.state !== 'succeeded' || category.generation < 1 ||
+            root.rootTaskId.toLowerCase() !== category.id || root.tagsTaskId.toLowerCase() !== task.id || root.prepareTaskId.toLowerCase() !== category.prerequisiteId ||
+            task.prerequisiteId !== category.id || tags.rootTaskId.toLowerCase() !== category.id || tags.prepareTaskId.toLowerCase() !== prepare.id ||
+            tags.requiredHandoff.taskId.toLowerCase() !== category.id || tags.requiredHandoff.generation !== category.generation ||
+            JSON.stringify(candidate.chainRoot && decodeChainMetadataV1(candidate.chainRoot, 'category')) !== JSON.stringify(root) ||
+            JSON.stringify(candidate.chainConsumer && decodeChainMetadataV1(candidate.chainConsumer, 'tags')) !== JSON.stringify(tags) ||
+            categoryReceipt.action !== 'category' || categoryReceipt.taskId.toLowerCase() !== category.id || categoryReceipt.articleId.toLowerCase() !== article.id ||
+            categoryReceipt.generation !== category.generation || categoryReceipt.prerequisiteId?.toLowerCase() !== prepare.id ||
+            JSON.stringify(categoryReceipt) !== JSON.stringify(candidate.prerequisiteReceipt) || JSON.stringify(tags.requiredBasis) !== JSON.stringify(categoryReceipt.basis) ||
+            root.requiredBasis.contentRevision !== categoryReceipt.basis.contentRevision || root.requiredBasis.articleInputHash !== categoryReceipt.basis.articleInputHash ||
+            categoryReceipt.basis.assignmentRevision < root.requiredBasis.assignmentRevision || categoryReceipt.basis.assignmentRevision - root.requiredBasis.assignmentRevision > 1 ||
+            categoryReceipt.categoryId.toLowerCase() !== article.categoryId || categoryReceipt.basis.contentRevision !== article.contentRevision ||
+            categoryReceipt.basis.assignmentRevision !== article.assignmentRevision || categoryReceipt.basis.articleInputHash !== articleFingerprint(article.title, article.sourceId) ||
+            prepare.articleId !== article.id || prepare.action !== 'prepare' || prepare.state !== 'succeeded' || preparation.taskId.toLowerCase() !== prepare.id ||
+            preparation.articleId.toLowerCase() !== article.id || preparation.generation !== prepare.generation || preparation.contentRevision !== article.contentRevision ||
+            history.some(row => row.articleId === article.id && ((row.action === 'prepare' && row.generation > prepare.generation) ||
+              (row.action === 'category' && row.generation > category.generation) || (row.action === 'tags' && row.generation > task.generation)))) throw new RejectTagHandoff();
+        const scores = history.filter(row => row.prerequisiteId === task.id || (row.action === 'scores' && readChainMetadata(row.result, 'scores')?.rootTaskId.toLowerCase() === category.id));
+        const targetIds = new Set<string>();
+        if (scores.length !== root.targetCount) throw new RejectTagHandoff();
+        for (const score of scores) {
+          const link = readChainMetadata(score.result, 'scores');
+          if (score.articleId !== article.id || score.action !== 'scores' || score.prerequisiteId !== task.id || !score.scoreTargetId ||
+              targetIds.has(score.scoreTargetId) || score.generation < 1 || !link || !link.requiredHandoff || link.rootTaskId.toLowerCase() !== category.id ||
+              link.prepareTaskId.toLowerCase() !== prepare.id || link.requiredHandoff.taskId.toLowerCase() !== task.id || link.requiredHandoff.generation !== task.generation ||
+              (score.state === 'waiting_dependency' && (link.requiredBasis !== null || score.jobId !== null)) ||
+              (!['waiting_dependency', 'succeeded', 'failed', 'superseded'].includes(score.state))) throw new RejectTagHandoff();
+          targetIds.add(score.scoreTargetId);
+        }
+        const published = await this.publishTagCandidateInternal(tx, candidate, at, true);
+        if (!published) return null;
+        const receipt = decodeHandoffReceiptV1(published.receipt);
+        const [savedTag] = await tx.select().from(processingTasks).where(eq(processingTasks.id, task.id));
+        if (!savedTag || savedTag.state !== 'succeeded' || JSON.stringify(readChainMetadata(savedTag.result, 'tags')) !== JSON.stringify(tags) ||
+            JSON.stringify(readHandoffReceipt(savedTag.result)) !== JSON.stringify(receipt)) throw new RejectTagHandoff();
+        const savedScores = await tx.select().from(processingTasks).where(inArray(processingTasks.id, scores.map(score => score.id))).orderBy(processingTasks.id);
+        if (JSON.stringify(savedScores) !== JSON.stringify(scores)) throw new RejectTagHandoff();
+        if (!receipt || receipt.action !== 'tags' || receipt.taskId.toLowerCase() !== task.id || receipt.articleId.toLowerCase() !== article.id ||
+            receipt.generation !== task.generation || receipt.prerequisiteId?.toLowerCase() !== category.id || receipt.categoryId.toLowerCase() !== article.categoryId ||
+            receipt.basis.contentRevision !== article.contentRevision || receipt.basis.assignmentRevision !== published.assignmentRevision ||
+            receipt.basis.articleInputHash !== articleFingerprint(article.title, article.sourceId) || receipt.catalogEpoch !== published.catalogEpoch) throw new RejectTagHandoff();
+        for (const score of scores) {
+          if (score.state !== 'waiting_dependency') continue;
+          const definition = definitions.find(row => row.id === score.scoreTargetId);
+          const newer = history.some(row => row.articleId === article.id && row.action === 'scores' && row.scoreTargetId === score.scoreTargetId && row.generation > score.generation);
+          const reason = !definition || !definition.active || definition.deletedAt ? 'target_unavailable' : newer ? 'newer_generation' : null;
+          if (reason) {
+            const retired = await tx.update(processingTasks).set({ state: 'superseded', errorCode: reason, updatedAt: at, endedAt: at }).where(and(eq(processingTasks.id, score.id), eq(processingTasks.state, 'waiting_dependency'))).returning();
+            if (retired.length !== 1 || retired[0]?.state !== 'superseded' || retired[0]?.errorCode !== reason) throw new Error('Score retirement failed');
+            continue;
+          }
+          const link = readChainMetadata(score.result, 'scores')!;
+          const next = decodeChainMetadataV1({ ...link, requiredBasis: receipt.basis }, 'scores');
+          if (!next) throw new RejectTagHandoff();
+          const activated = await tx.update(processingTasks).set({ state: 'queued', result: { ...score.result, articleChain: next }, updatedAt: at })
+            .where(and(eq(processingTasks.id, score.id), eq(processingTasks.state, 'waiting_dependency'), isNull(processingTasks.jobId))).returning();
+          if (activated.length !== 1 || activated[0]?.state !== 'queued' || JSON.stringify(readChainMetadata(activated[0]?.result, 'scores')) !== JSON.stringify(next)) throw new Error('Score activation failed');
+          const saved = await enqueueScoreTask(tx, this.boss, score.id);
+          if (saved.state !== 'queued' || saved.articleId !== article.id || saved.action !== 'scores' || saved.prerequisiteId !== task.id ||
+              saved.scoreTargetId !== score.scoreTargetId || saved.generation !== score.generation ||
+              JSON.stringify(readChainMetadata(saved.result, 'scores')) !== JSON.stringify(next)) throw new Error('Score job persistence failed');
+        }
+        return published;
+      }, { isolationLevel: 'read committed' });
+    } catch (error) {
+      if (error instanceof RejectTagHandoff || error instanceof RejectTagCandidate) return null;
+      throw error;
+    }
+  }
 
   async publishCategoryCandidate(candidate: CategoryCandidate, at: Date): Promise<CategoryPublication | null> {
     if (!candidate || ![candidate.taskId, candidate.articleId, candidate.categoryId].every(value => typeof value === 'string' && uuid.test(value))) return null;
@@ -83,6 +184,14 @@ export class ArticleJobs {
   }
 
   async admitPreparedArticle(articleId: string, prepareTaskId: string, at: Date) {
+    return this.admitPreparedArticleInternal(articleId, prepareTaskId, at, false);
+  }
+
+  async admitFirstPreparedArticle(articleId: string, prepareTaskId: string, at: Date) {
+    return this.admitPreparedArticleInternal(articleId, prepareTaskId, at, true);
+  }
+
+  private async admitPreparedArticleInternal(articleId: string, prepareTaskId: string, at: Date, firstTimeOnly: boolean) {
     if (!(at instanceof Date) || !Number.isFinite(at.getTime())) throw new Error('Invalid admission timestamp');
     if (!uuid.test(articleId)) return { kind: 'not_found' as const };
     if (!uuid.test(prepareTaskId)) return { kind: 'needs_input' as const };
@@ -98,6 +207,9 @@ export class ArticleJobs {
       // Fresh statement after the article lock sees all committed admissions and publications.
       const history = await tx.select().from(processingTasks).where(eq(processingTasks.articleId, article.id))
         .orderBy(processingTasks.id).for('update');
+      // First-time callers may only have their own preparation task, including after concurrent admissions.
+      if (firstTimeOnly && history.some(task => task.id !== prepareTaskId.toLowerCase() &&
+          ['prepare', 'category', 'tags', 'scores'].includes(task.action))) return { kind: 'already_started' as const };
       const prepare = history.find(task => task.id === prepareTaskId.toLowerCase());
       const receipt = prepare && readPreparationReceipt(prepare.result);
       const [content] = await tx.select().from(articleContents).where(eq(articleContents.articleId, article.id)).for('share');

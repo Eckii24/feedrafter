@@ -21,6 +21,10 @@ The migrate command requires both `DATABASE_URL` and `APP_ORIGIN`; it applies Dr
 
 FreshRSS is disabled by default. If explicitly enabled in an operator-maintained override, pass `FRESHRSS_ENABLED=true`, `FRESHRSS_BASE_URL`, `FRESHRSS_EMAIL`, and a protected read-only mounted secret file via `FRESHRSS_API_PASSWORD_FILE`; see [server/API](server-api.md). Protect Docker configuration and secret files. D1 **never sends FreshRSS read acknowledgements**, even when configured; pending intents remain visible. No provider credentials belong in the image, build context, documentation or logs.
 
+## Synthetic local product test
+
+The test-only fixture described in [README](../README.md#repeatable-synthetic-product-test) starts its own uniquely named disposable PostgreSQL 18 container and real PgBoss, injects fake AI in-process, and stops its own resources. It never accepts an external database URL. It uses real preparation and admission but does not wire automatic import, live providers, recovery or normal-serving category/tag workers. Queue provisioning remains an explicit migration operation. Local evidence is not authorization to activate production inference: target/rollback, provider/model/auth, article disclosure, usage limits and a separately approved canary remain open; see [verification](verification.md).
+
 ## Health and troubleshooting
 
 `/api/v1/health/live` checks the process; `/api/v1/health/ready` checks DB connectivity and required schema/version, not provider availability or writable data mounts. The image healthcheck checks write access to `/data` and `/tmp`, then probes readiness locally with the configured Host. A 503 means DB/schema is unavailable or mismatched: verify configuration and migrate explicitly; no provider calls are made by the probe. When testing from the host or monitoring agent, send Host matching `APP_ORIGIN` (and route through the private boundary). Inspect health with `docker compose ps` and logs with `docker compose logs app`; restrict access to operational output. The application suppresses detailed startup and queue errors to avoid leaking credentials; inspect database-side diagnostics securely.

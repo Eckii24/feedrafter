@@ -24,7 +24,10 @@ async function fixture() {
   await new ContentStore(db.db).saveSuccessful(article, { text: 'Body', quality: 'usable', capturedAt: at });
   const tasks = new TaskStore(db.db), catalog = new CatalogStore(db.db);
   const prepare = await tasks.createTask({ articleId: article, action: 'prepare', generation: 1, state: 'succeeded', createdAt: at, updatedAt: at });
-  const category = await tasks.createTask({ articleId: article, action: 'category', generation: 1, state: 'succeeded', prerequisiteId: prepare.id, createdAt: at, updatedAt: at });
+  const category = await tasks.createTask({ articleId: article, action: 'category', generation: 1, prerequisiteId: prepare.id, createdAt: at, updatedAt: at });
+  const categoryToken = randomUUID(); await tasks.claimTask(category.id, categoryToken, at);
+  const basis = (await db.pool.query('select category_id,content_revision,assignment_revision,(select revision from catalog_epoch where id=1) as epoch from articles where id=$1', [article])).rows[0];
+  expect(await catalog.publishCategoryCandidate({ taskId: category.id, executionToken: categoryToken, articleId: article, generation: 1, prerequisiteId: prepare.id, contentRevision: basis.content_revision, contentText: 'Body', assignmentRevision: basis.assignment_revision, catalogEpoch: basis.epoch, categoryId: basis.category_id }, at)).not.toBeNull();
   const task = await tasks.createTask({ articleId: article, action: 'tags', generation: 1, prerequisiteId: category.id, createdAt: at, updatedAt: at });
   const token = randomUUID(); await tasks.claimTask(task.id, token, at);
   const label = `candidate-${randomUUID()}`;

@@ -138,10 +138,22 @@ it('admits through HTTP and completes only active targets; normal composition st
     const unavailable = await buildHttpApp({ db: database.db, pool: database.pool, origin: 'http://localhost:3000', trustedProxies: [] });
     try { expect((await unavailable.inject({ method: 'POST', url: `/api/v1/articles/${f.article}/reevaluations`, headers, payload: {} })).statusCode).toBe(503); } finally { await unavailable.close(); }
   } finally { stream.destroy(); await app.close(); }
+  const articleQueues = ['category', 'tags'];
+  const queues = async () => (await database.pool.query('select name from pgboss.queue where name = any($1::text[])', [articleQueues])).rows;
+  expect(await queues()).toEqual([]);
   const runtime = vi.spyOn(ModelRuntime, 'create');
   const fetchSpy = vi.spyOn(globalThis, 'fetch');
-  const application = await buildApplication({ databaseUrl, origin: 'http://localhost:3000', host: '127.0.0.1', port: 3000, trustedProxies: [] });
+  const createQueue = vi.spyOn(PgBoss.prototype, 'createQueue');
+  const work = vi.spyOn(PgBoss.prototype, 'work');
+  let application: Awaited<ReturnType<typeof buildApplication>> | undefined;
   try {
+    application = await buildApplication({ databaseUrl, origin: 'http://localhost:3000', host: '127.0.0.1', port: 3000, trustedProxies: [] });
+    expect(await queues()).toEqual([]);
+    for (const name of articleQueues) {
+      expect(createQueue.mock.calls.map(([queue]) => queue)).not.toContain(name);
+      expect(work.mock.calls.map(([queue]) => queue)).not.toContain(name);
+    }
+    expect(work.mock.calls.map(([name]) => name)).toContain(SCORE_QUEUE);
     const result = await application.app.inject({ method: 'POST', url: `/api/v1/articles/${f.article}/reevaluations`, headers, payload: {} });
     expect(result.statusCode).toBe(202);
     const id = result.json().tasks[0].taskId;
@@ -149,7 +161,10 @@ it('admits through HTTP and completes only active targets; normal composition st
     const status = await application.app.inject({ url: `/api/v1/processing-tasks/${id}`, headers });
     expect(status.json()).toMatchObject({ id, action: 'scores', state: 'needs_input', errorCode: 'configuration_required', endedAt: null });
     expect(runtime).not.toHaveBeenCalled(); expect(fetchSpy).not.toHaveBeenCalled();
-  } finally { await application.close(); runtime.mockRestore(); fetchSpy.mockRestore(); }
+  } finally {
+    try { await application?.close(); }
+    finally { runtime.mockRestore(); fetchSpy.mockRestore(); createQueue.mockRestore(); work.mockRestore(); }
+  }
 }, 30000);
 
 it('completes misrouted category and tags jobs without claiming either task', async () => {

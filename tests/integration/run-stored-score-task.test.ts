@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import { createUsageDatabase } from '../helpers/usage-database.js';
+import { linkedScoreFixture } from '../helpers/linked-score-fixture.js';
 import { migrateDatabase } from '../../src/server/adapters/postgres/migrate.js';
 import { ContentStore } from '../../src/server/adapters/postgres/content-store.js';
 import { ScoreStore } from '../../src/server/adapters/postgres/score-store.js';
@@ -44,6 +45,126 @@ async function fixture() {
   const record = async () => ({ task: await tasks.getTask(task.id), score: await scores.get(article, score) });
   return { article, task, deps, record };
 }
+
+it('consumer-only real receipts traverse the stored executor and publish', async () => {
+  const f = await linkedScoreFixture(db, context, score, at);
+  const seen = vi.fn(async (...args: Parameters<ScoreStore['publishCandidate']>) => new ScoreStore(db.db).publishCandidate(...args));
+  const classify = vi.fn<AiPort['classify']>().mockResolvedValue({ kind: 'completed', value: { answers: { score: { type: 'score', score: 1.5, confidence: 1, criteria: [] } }, usage: null } });
+  // Historical handoff epoch is not the dispatch epoch.
+  await db.pool.query('update catalog_epoch set revision=revision+1 where id=1');
+  expect(await runStoredScoreTask(f.score.id, { ai: { classify, generate: vi.fn(), createRestrictedSession: vi.fn() }, inputs: new ScoreTaskInputStore(db.pool), scores: { publishCandidate: seen }, tasks: f.tasks, models, signal: new AbortController().signal, now: () => at })).toEqual({ kind: 'published' });
+  expect(seen).toHaveBeenCalledOnce();
+  expect(seen.mock.calls[0]![0].basis.handoff).toMatchObject({ root: f.root, tags: f.tags, consumer: f.consumer, receipt: f.tagReceipt });
+  expect(await new ScoreStore(db.db).get(f.article, score)).toMatchObject({ value: 37.5 });
+  expect(classify.mock.calls[0]![0].state).toEqual({ title: 'Linked title', content: 'Linked body' });
+});
+
+it('consumer-only dispatch uses current eligible score configuration after receipt creation', async () => {
+  const target = (await db.pool.query("insert into score_definitions(name,description,prompt) values ($1,'','old') returning id", [randomUUID()])).rows[0].id as string;
+  const f = await linkedScoreFixture(db, context, target, at);
+  await db.pool.query("update score_definitions set prompt='new prompt',include_title=true,include_content=false,include_category=false,include_tag_weights=false,include_source_weight=false where id=$1", [target]);
+  await db.pool.query('update catalog_epoch set revision=revision+1 where id=1');
+  const classify = vi.fn<AiPort['classify']>().mockResolvedValue({ kind: 'completed', value: { answers: { score: { type: 'score', score: 0, confidence: 1, criteria: [] } }, usage: null } });
+  expect(await runStoredScoreTask(f.score.id, { ai: { classify, generate: vi.fn(), createRestrictedSession: vi.fn() }, inputs: new ScoreTaskInputStore(db.pool), scores: new ScoreStore(db.db), tasks: f.tasks, models, signal: new AbortController().signal, now: () => at })).toEqual({ kind: 'published' });
+  expect(classify.mock.calls[0]![0]).toMatchObject({ state: { title: 'Linked title' }, questions: { score: { instructions: 'new prompt' } } });
+  expect(await new ScoreStore(db.db).get(f.article, target)).toMatchObject({ value: 0 });
+});
+
+const linkedTampering = ['missing score chain', 'null score chain', 'zero score reference', 'unactivated score', 'wrong activated basis', 'wrong score reference', 'wrong score prepare', 'rewired score', 'missing tags receipt', 'malformed tags receipt', 'wrong tags receipt generation', 'wrong tags receipt article', 'wrong actual tag generation', 'missing tag chain', 'zero tag reference', 'rewired tag', 'missing root', 'old root', 'zero target count', 'wrong anchor', 'wrong root', 'missing category receipt', 'wrong category receipt generation', 'wrong actual category generation', 'missing preparation receipt', 'wrong preparation generation', 'wrong preparation article', 'title', 'source', 'category', 'content revision', 'assignment revision', 'newer tags', 'newer category', 'newer prepare'] as const;
+it.each(linkedTampering.flatMap(change => ([['before', change], ['during', change]] as const)))('consumer-only rejects %s inference tampering: %s', async (when, change) => {
+  const f = await linkedScoreFixture(db, context, score, at);
+  const scores = new ScoreStore(db.db);
+  expect(await scores.saveSuccessful({ articleId: f.article, scoreId: score, value: 25, calculatedAt: at, contentRevision: 1, assignmentRevision: 0 })).toBe(true);
+  const before = await scores.get(f.article, score);
+  const tamper = async () => {
+    switch (change) {
+      case 'missing score chain': await db.pool.query("update processing_tasks set result=result-'articleChain' where id=$1", [f.score.id]); break;
+      case 'null score chain': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain}','null') where id=$1", [f.score.id]); break;
+      case 'zero score reference': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,requiredHandoff,generation}','0') where id=$1", [f.score.id]); break;
+      case 'unactivated score': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,requiredBasis}','null') where id=$1", [f.score.id]); break;
+      case 'wrong activated basis': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,requiredBasis,assignmentRevision}','100') where id=$1", [f.score.id]); break;
+      case 'wrong score reference': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,requiredHandoff,taskId}',to_jsonb($2::text)) where id=$1", [f.score.id, randomUUID()]); break;
+      case 'wrong score prepare': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,prepareTaskId}',to_jsonb($2::text)) where id=$1", [f.score.id, randomUUID()]); break;
+      case 'rewired score': await db.pool.query('update processing_tasks set prerequisite_id=$2 where id=$1', [f.score.id, f.category.id]); break;
+      case 'missing tags receipt': await db.pool.query("update processing_tasks set result=result-'handoffReceipt' where id=$1", [f.tag.id]); break;
+      case 'malformed tags receipt': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{handoffReceipt}','null') where id=$1", [f.tag.id]); break;
+      case 'wrong tags receipt generation': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{handoffReceipt,generation}','0') where id=$1", [f.tag.id]); break;
+      case 'wrong tags receipt article': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{handoffReceipt,articleId}',to_jsonb($2::text)) where id=$1", [f.tag.id, randomUUID()]); break;
+      case 'wrong actual tag generation': await db.pool.query('update processing_tasks set generation=2 where id=$1', [f.tag.id]); break;
+      case 'missing tag chain': await db.pool.query("update processing_tasks set result=result-'articleChain' where id=$1", [f.tag.id]); break;
+      case 'zero tag reference': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,requiredHandoff,generation}','0') where id=$1", [f.tag.id]); break;
+      case 'rewired tag': await db.pool.query('update processing_tasks set prerequisite_id=$2 where id=$1', [f.tag.id, f.prepare.id]); break;
+      case 'missing root': await db.pool.query("update processing_tasks set result=result-'articleChain' where id=$1", [f.category.id]); break;
+      case 'old root': await db.pool.query("update processing_tasks set result=result #- '{articleChain,tagsTaskId}' where id=$1", [f.category.id]); break;
+      case 'zero target count': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,targetCount}','0') where id=$1", [f.category.id]); break;
+      case 'wrong anchor': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,tagsTaskId}',to_jsonb($2::text)) where id=$1", [f.category.id, randomUUID()]); break;
+      case 'wrong root': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{articleChain,rootTaskId}',to_jsonb($2::text)) where id=$1", [f.score.id, randomUUID()]); break;
+      case 'missing category receipt': await db.pool.query("update processing_tasks set result=result-'handoffReceipt' where id=$1", [f.category.id]); break;
+      case 'wrong category receipt generation': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{handoffReceipt,generation}','0') where id=$1", [f.category.id]); break;
+      case 'wrong actual category generation': await db.pool.query('update processing_tasks set generation=2 where id=$1', [f.category.id]); break;
+      case 'missing preparation receipt': await db.pool.query("update processing_tasks set result=result-'preparationReceipt' where id=$1", [f.prepare.id]); break;
+      case 'wrong preparation generation': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{preparationReceipt,generation}','2') where id=$1", [f.prepare.id]); break;
+      case 'wrong preparation article': await db.pool.query("update processing_tasks set result=jsonb_set(result,'{preparationReceipt,articleId}',to_jsonb($2::text)) where id=$1", [f.prepare.id, randomUUID()]); break;
+      case 'title': await db.pool.query("update articles set title='Changed' where id=$1", [f.article]); break;
+      case 'source': { const id = (await db.pool.query('insert into sources(context_id,external_feed_id) values ($1,$2) returning id', [context, randomUUID()])).rows[0].id; await db.pool.query('update articles set source_id=$2 where id=$1', [f.article, id]); break; }
+      case 'category': await db.pool.query("update articles set category_id='00000000-0000-4000-8000-000000000003' where id=$1", [f.article]); break;
+      case 'content revision': await db.pool.query('update articles set content_revision=content_revision+1 where id=$1', [f.article]); break;
+      case 'assignment revision': await db.pool.query('update articles set assignment_revision=assignment_revision+1 where id=$1', [f.article]); break;
+      case 'newer tags': case 'newer category': case 'newer prepare': await f.tasks.createTask({ articleId: f.article, action: change.slice(6), generation: 2, state: 'failed', createdAt: at, updatedAt: at }); break;
+    }
+  };
+  if (when === 'before') await tamper();
+  const classify = vi.fn<AiPort['classify']>().mockImplementation(async () => { if (when === 'during') await tamper(); return { kind: 'completed', value: { answers: { score: { type: 'score', score: 4, confidence: 1, criteria: [] } }, usage: null } }; });
+  const result = await runStoredScoreTask(f.score.id, { ai: { classify, generate: vi.fn(), createRestrictedSession: vi.fn() }, inputs: new ScoreTaskInputStore(db.pool), scores, tasks: f.tasks, models, signal: new AbortController().signal, now: () => at });
+  const stale = ['title', 'source', 'category', 'content revision', 'assignment revision', 'newer tags', 'newer category', 'newer prepare'].includes(change);
+  const expectedState = when === 'during' || stale ? 'superseded' : 'needs_input';
+  const expectedError = expectedState === 'superseded' ? 'stale_basis' : 'invalid_handoff';
+  expect(result).toEqual({ kind: expectedState });
+  expect(await f.tasks.getTask(f.score.id)).toMatchObject({ state: expectedState, errorCode: expectedError });
+  expect(classify).toHaveBeenCalledTimes(when === 'before' ? 0 : 1);
+  expect(await scores.get(f.article, score)).toEqual(before);
+});
+
+it.each(['content text', 'category receipt epoch', 'preparation receipt', 'both score linkage fields'])('consumer-only rejects %s changed in flight', async change => {
+  const f = await linkedScoreFixture(db, context, score, at);
+  const scores = new ScoreStore(db.db);
+  const classify = vi.fn<AiPort['classify']>().mockImplementation(async () => {
+    if (change === 'content text') await db.pool.query("update article_contents set text='changed' where article_id=$1", [f.article]);
+    if (change === 'category receipt epoch') await db.pool.query("update processing_tasks set result=jsonb_set(result,'{handoffReceipt,catalogEpoch}',to_jsonb((result->'handoffReceipt'->>'catalogEpoch')::int+1)) where id=$1", [f.category.id]);
+    if (change === 'preparation receipt') await db.pool.query("update processing_tasks set result=result-'preparationReceipt' where id=$1", [f.prepare.id]);
+    if (change === 'both score linkage fields') await db.pool.query("update processing_tasks set prerequisite_id=null,result=result-'articleChain' where id=$1", [f.score.id]);
+    return { kind: 'completed', value: { answers: { score: { type: 'score', score: 4, confidence: 1, criteria: [] } }, usage: null } };
+  });
+  expect(await runStoredScoreTask(f.score.id, { ai: { classify, generate: vi.fn(), createRestrictedSession: vi.fn() }, inputs: new ScoreTaskInputStore(db.pool), scores, tasks: f.tasks, models, signal: new AbortController().signal, now: () => at })).toEqual({ kind: 'superseded' });
+  expect(await scores.get(f.article, score)).toBeNull();
+});
+
+it.each(['null', 'malformed'])('explicit root with %s namespace fails before AI', async value => {
+  const f = await fixture();
+  await db.pool.query("update processing_tasks set result=jsonb_build_object('articleChain',$2::jsonb) where id=$1", [f.task.id, value === 'null' ? 'null' : '{}']);
+  expect(await runStoredScoreTask(f.task.id, f.deps)).toEqual({ kind: 'needs_input' });
+  expect((await f.record()).task).toMatchObject({ errorCode: 'invalid_handoff' });
+  expect(f.deps.ai.classify).not.toHaveBeenCalled();
+});
+
+it('rejects an explicit root whose persisted namespace appears during inference', async () => {
+  const f = await fixture();
+  f.deps.ai.classify.mockImplementationOnce(async () => {
+    await db.pool.query("update processing_tasks set result=jsonb_build_object('articleChain',null) where id=$1", [f.task.id]);
+    return { kind: 'completed', value: { answers: { score: { type: 'score', score: 4, confidence: 1, criteria: [] } }, usage: null } };
+  });
+  expect(await runStoredScoreTask(f.task.id, f.deps)).toEqual({ kind: 'superseded' });
+  expect((await f.record()).score).toMatchObject({ value: 25 });
+});
+
+it('consumer-only rejects omission of captured link at publication', async () => {
+  const f = await linkedScoreFixture(db, context, score, at);
+  const scores = new ScoreStore(db.db);
+  const classify = vi.fn<AiPort['classify']>().mockResolvedValue({ kind: 'completed', value: { answers: { score: { type: 'score', score: 4, confidence: 1, criteria: [] } }, usage: null } });
+  const publishCandidate: ScoreStore['publishCandidate'] = (candidate, time) => { const basis = { ...candidate.basis }; delete basis.handoff; return scores.publishCandidate({ ...candidate, basis }, time); };
+  expect(await runStoredScoreTask(f.score.id, { ai: { classify, generate: vi.fn(), createRestrictedSession: vi.fn() }, inputs: new ScoreTaskInputStore(db.pool), scores: { publishCandidate }, tasks: f.tasks, models, signal: new AbortController().signal, now: () => at })).toEqual({ kind: 'superseded' });
+  expect(await scores.get(f.article, score)).toBeNull();
+});
 
 it('claims once, loads persisted context and atomically publishes', async () => {
   const f = await fixture();

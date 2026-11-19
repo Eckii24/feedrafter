@@ -2,12 +2,13 @@ import type pg from 'pg';
 import { DEFAULT_PREFERENCE_HALF_LIFE_DAYS, weight, type VoteValue } from '../../domain/preferences.js';
 import type { ScoreContextTask } from '../../application/process-context-chunks.js';
 import { validateVerifiedModel, type VerifiedModel } from '../../application/score-context-request.js';
+import { captureScoreHandoff } from './score-handoff.js';
 
 type StoredVote = { value: VoteValue; votedAt: string };
 type StoredWeight = { offset: number; votes: StoredVote[] };
 
 export type ScoreTaskModels = { classifier: VerifiedModel; generator: VerifiedModel };
-export type ScoreTaskInputResult = { kind: 'loaded'; input: ScoreContextTask } | { kind: 'stale_basis' | 'configuration_required' };
+export type ScoreTaskInputResult = { kind: 'loaded'; input: ScoreContextTask } | { kind: 'stale_basis' | 'configuration_required' | 'invalid_handoff' };
 
 /** Captures one owned score task; inference must happen after this method returns. */
 export class ScoreTaskInputStore {
@@ -45,9 +46,18 @@ export class ScoreTaskInputStore {
       const article = await client.query<{ id: string; title: string | null; category_id: string; source_id: string | null; content_revision: number; assignment_revision: number }>('select id, title, category_id, source_id, content_revision, assignment_revision from articles where id=$1 for update', [hint.rows[0].article_id]);
       const a = article.rows[0];
       if (!a) { await client.query('rollback'); return stale; }
-      const task = await client.query<{ id: string; article_id: string; action: string; score_target_id: string | null; state: string; execution_token: string | null; generation: number }>('select id, article_id, action, score_target_id, state, execution_token, generation from processing_tasks where id=$1 for update', [taskId]);
+      const task = await client.query<{ id: string; article_id: string; action: string; score_target_id: string | null; state: string; execution_token: string | null; generation: number; prerequisite_id: string | null; result: unknown }>('select id, article_id, action, score_target_id, state, execution_token, generation, prerequisite_id, result from processing_tasks where id=$1 for update', [taskId]);
       const t = task.rows[0];
       if (!t || t.article_id !== a.id || t.action !== 'scores' || t.score_target_id !== def.id || t.state !== 'running' || t.execution_token !== executionToken.toLowerCase()) { await client.query('rollback'); return stale; }
+      const handoff = await captureScoreHandoff({ id: t.id, articleId: t.article_id, action: t.action, state: t.state, generation: t.generation, prerequisiteId: t.prerequisite_id, result: t.result }, { id: a.id, title: a.title, sourceId: a.source_id, categoryId: a.category_id, contentRevision: a.content_revision, assignmentRevision: a.assignment_revision }, {
+        task: async id => {
+          const row = (await client.query<{ id: string; article_id: string; action: string; state: string; generation: number; prerequisite_id: string | null; result: unknown }>('select id,article_id,action,state,generation,prerequisite_id,result from processing_tasks where id=$1 for share', [id])).rows[0];
+          return row ? { id: row.id, articleId: row.article_id, action: row.action, state: row.state, generation: row.generation, prerequisiteId: row.prerequisite_id, result: row.result } : null;
+        },
+        newer: async (articleId, action, generation) => !!(await client.query('select 1 from processing_tasks where article_id=$1 and action=$2 and generation>$3 limit 1', [articleId, action, generation])).rowCount,
+        content: async articleId => (await client.query<{ text: string; revision: number }>('select text,revision from article_contents where article_id=$1 for share', [articleId])).rows[0] ?? null,
+      });
+      if (handoff.kind === 'invalid_handoff' || handoff.kind === 'stale_basis') { await client.query('rollback'); return { kind: handoff.kind }; }
       // One statement snapshot after the article lock is essential: a newer task
       // can be inserted under that lock without updating the article row. A fixed
       // transaction snapshot taken before waiting would miss it.
@@ -77,7 +87,7 @@ export class ScoreTaskInputStore {
       const tagWeights = d.tags.map(tag => ({ tag: tag.label, weight: calculate(tag) }));
       const sourceWeight = d.source ? calculate(d.source) : null;
       const result: ScoreContextTask = {
-        owner: { taskId: t.id, executionToken: t.execution_token, assignmentRevision: a.assignment_revision, catalogEpoch: epoch.rows[0]!.revision },
+        owner: { taskId: t.id, executionToken: t.execution_token, assignmentRevision: a.assignment_revision, catalogEpoch: epoch.rows[0]!.revision, ...(handoff.kind === 'linked' ? { handoff: handoff.value } : {}) },
         scoreId: t.score_target_id!, generation: t.generation, prompt: d.override_prompt ?? def.prompt,
         article: { id: a.id, title: a.title, content: d.content ?? '', contentRevision: a.content_revision, category: d.category, tagWeights, sourceWeight },
         fields: { includeTitle: def.include_title, includeContent: def.include_content, includeCategory: def.include_category, includeTagWeights: def.include_tag_weights, includeSourceWeight: def.include_source_weight },

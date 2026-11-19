@@ -6,9 +6,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createDatabase } from "../../src/server/adapters/postgres/client.js";
 import { migrateDatabase } from "../../src/server/adapters/postgres/migrate.js";
 import { ScoreStore } from "../../src/server/adapters/postgres/score-store.js";
+import { ScoreTaskInputStore } from "../../src/server/adapters/postgres/score-task-input-store.js";
+import { linkedScoreFixture } from "../helpers/linked-score-fixture.js";
 import { ContentStore } from "../../src/server/adapters/postgres/content-store.js";
 import { CatalogStore, RejectTagCandidate } from "../../src/server/adapters/postgres/catalog-store.js";
 import { TaskStore } from "../../src/server/adapters/postgres/task-store.js";
+import { readHandoffReceipt } from "../../src/server/domain/article-handoff.js";
 import { UsageStore } from "../../src/server/adapters/postgres/usage-store.js";
 import { processContextChunks, type ScoreContextTask } from "../../src/server/application/process-context-chunks.js";
 import { runDirectScoreTask } from "../../src/server/application/run-direct-score-task.js";
@@ -533,17 +536,70 @@ describe('category candidate publication', () => {
 
 async function tagCandidateFixture(setup?: (catalog: CatalogStore, id: string) => Promise<void>) {
   const f = await categoryCandidateFixture();
-  expect(await f.catalog.publishCategoryCandidate(f.candidate, f.at)).toMatchObject({ assignmentRevision: 1 });
+  const published = await f.catalog.publishCategoryCandidate(f.candidate, f.at);
+  expect(published).toMatchObject({ assignmentRevision: 1 });
+  if (!published) throw new Error('Expected category publication');
   await setup?.(f.catalog, f.id);
   const task = await f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 1, prerequisiteId: f.task.id, createdAt: f.at, updatedAt: f.at });
   const executionToken = randomUUID();
   await f.tasks.claimTask(task.id, executionToken, f.at);
   const catalogEpoch = (await database.pool.query<{ revision: number }>('select revision from catalog_epoch where id=1')).rows[0]!.revision;
-  const candidate = { taskId: task.id, executionToken, articleId: f.id, generation: 1, title: null, contentRevision: 1, contentText: 'original', categoryId: f.category.id, assignmentRevision: (await f.article()).assignment_revision as number, catalogEpoch, prerequisiteTaskId: f.task.id, prerequisiteGeneration: 1, categoryPrerequisiteId: null, labels: [] as string[] };
+  const candidate = { taskId: task.id, executionToken, articleId: f.id, generation: 1, title: null, contentRevision: 1, contentText: 'original', categoryId: f.category.id, assignmentRevision: (await f.article()).assignment_revision as number, catalogEpoch, prerequisiteTaskId: f.task.id, prerequisiteGeneration: 1, categoryPrerequisiteId: null, articleInputHash: published.receipt.basis.articleInputHash, prerequisiteReceipt: published.receipt, labels: [] as string[] };
   return { ...f, categoryTask: f.task, task, candidate };
 }
 
 describe('tag candidate publication', () => {
+  it('standalone tag publication persists its receipt', async () => {
+    const f = await tagCandidateFixture();
+    const published = await f.catalog.publishTagCandidate(f.candidate, f.at);
+    const saved = await f.tasks.getTask(f.task.id);
+    expect(saved).toMatchObject({ state: 'succeeded' });
+    const receipt = readHandoffReceipt(saved?.result);
+    expect(receipt).toMatchObject({ taskId: f.task.id, action: 'tags', generation: f.candidate.generation });
+    expect(published).toEqual({ assignmentRevision: 1, catalogEpoch: f.candidate.catalogEpoch, receipt });
+  });
+
+  it.each(['child null', 'child malformed', 'root null', 'root malformed'] as const)('rejects %s namespace through both tag publishers', async kind => {
+    const f = await tagCandidateFixture();
+    const id = kind.startsWith('child') ? f.task.id : f.categoryTask.id;
+    await database.pool.query("update processing_tasks set result=jsonb_set(coalesce(result,'{}'::jsonb),'{articleChain}',$2::jsonb) where id=$1", [id, kind.endsWith('null') ? 'null' : '{}']);
+    const before = await f.tasks.getTask(f.task.id), article = await f.article();
+    expect(await f.catalog.publishTagCandidate(f.candidate, f.at)).toBeNull();
+    expect(await database.db.transaction(tx => f.catalog.publishTagCandidateInTransaction(tx, f.candidate, f.at))).toBeNull();
+    expect(await f.tasks.getTask(f.task.id)).toEqual(before);
+    expect(await f.article()).toEqual(article);
+    expect(await f.catalog.listArticleTags(f.id)).toEqual([]);
+    expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(f.candidate.catalogEpoch);
+  });
+
+  it.each([['wrapper', 0], ['wrapper', 1], ['transaction', 0], ['transaction', 1]] as const)('persists standalone %s receipt at generation %i', async (entry, generation) => {
+    const f = await tagCandidateFixture();
+    await database.pool.query('update processing_tasks set generation=$2,result=$3 where id=$1', [f.task.id, generation, { other: 'preserved' }]);
+    const candidate = { ...f.candidate, generation, labels: [`receipt-${randomUUID()}`] };
+    const published = entry === 'wrapper' ? await f.catalog.publishTagCandidate(candidate, f.at) : await database.db.transaction(tx => f.catalog.publishTagCandidateInTransaction(tx, candidate, f.at));
+    expect(published).toMatchObject({ assignmentRevision: 2, catalogEpoch: candidate.catalogEpoch + 1, receipt: { taskId: f.task.id, generation, action: 'tags', prerequisiteId: f.categoryTask.id, basis: { contentRevision: 1, assignmentRevision: 2, articleInputHash: candidate.articleInputHash }, catalogEpoch: candidate.catalogEpoch + 1 } });
+    const task = await f.tasks.getTask(f.task.id);
+    expect(task).toMatchObject({ state: 'succeeded', generation, result: { other: 'preserved', handoffReceipt: published?.receipt } });
+    expect(readHandoffReceipt(task?.result)).toEqual(published?.receipt);
+  });
+
+  it.each(['wrapper', 'transaction'] as const)('rolls back written tag receipt on deferred commit through %s', async entry => {
+    const f = await tagCandidateFixture();
+    const before = await f.tasks.getTask(f.task.id), article = await f.article();
+    const label = `deferred-${randomUUID()}`;
+    await database.pool.query(`create function fail_tag_receipt_commit() returns trigger language plpgsql as $$ begin if new.id='${f.task.id}'::uuid and new.result ? 'handoffReceipt' then raise exception 'tag receipt commit failure'; end if; return new; end $$`);
+    await database.pool.query('create constraint trigger fail_tag_receipt_commit after update on processing_tasks deferrable initially deferred for each row execute function fail_tag_receipt_commit()');
+    try {
+      const candidate = { ...f.candidate, labels: [label] };
+      await expect(entry === 'wrapper' ? f.catalog.publishTagCandidate(candidate, f.at) : database.db.transaction(tx => f.catalog.publishTagCandidateInTransaction(tx, candidate, f.at))).rejects.toMatchObject({ cause: { message: 'tag receipt commit failure' } });
+      expect(await f.tasks.getTask(f.task.id)).toEqual(before);
+      expect(await f.article()).toEqual(article);
+      expect(await f.catalog.listArticleTags(f.id)).toEqual([]);
+      expect((await database.pool.query('select id from tags where label=$1', [label])).rowCount).toBe(0);
+      expect((await database.pool.query('select revision from catalog_epoch where id=1')).rows[0].revision).toBe(f.candidate.catalogEpoch);
+    } finally { await database.pool.query('drop trigger fail_tag_receipt_commit on processing_tasks; drop function fail_tag_receipt_commit()'); }
+  });
+
   it('rolls back caller-owned publication and propagates late rejection out of the transaction', async () => {
     let archived = '';
     const f = await tagCandidateFixture(async catalog => {
@@ -557,7 +613,7 @@ describe('tag candidate publication', () => {
       await f.catalog.publishTagCandidateInTransaction(tx, { ...f.candidate, labels: [label, archived] }, f.at);
     })).rejects.toBeInstanceOf(RejectTagCandidate);
     await expect(database.db.transaction(async tx => {
-      expect(await f.catalog.publishTagCandidateInTransaction(tx, { ...f.candidate, labels: [label] }, f.at)).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+      expect(await f.catalog.publishTagCandidateInTransaction(tx, { ...f.candidate, labels: [label] }, f.at)).toMatchObject({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, receipt: expect.any(Object) });
       throw new Error('caller rollback');
     })).rejects.toThrow('caller rollback');
     expect((await database.pool.query('select id from tags where label=$1', [label])).rowCount).toBe(0);
@@ -569,7 +625,7 @@ describe('tag candidate publication', () => {
 
   it('accepts an empty list without changing revisions', async () => {
     const f = await tagCandidateFixture();
-    expect(await f.catalog.publishTagCandidate(f.candidate, f.at)).toEqual({ assignmentRevision: 1, catalogEpoch: f.candidate.catalogEpoch });
+    expect(await f.catalog.publishTagCandidate(f.candidate, f.at)).toMatchObject({ assignmentRevision: 1, catalogEpoch: f.candidate.catalogEpoch, receipt: expect.any(Object) });
     expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded', endedAt: f.at });
   });
 
@@ -583,13 +639,13 @@ describe('tag candidate publication', () => {
       await database.pool.query('insert into tag_votes(article_id, tag_id, value, voted_at) values ($1,$2,1,now())', [id, tag.id]);
     });
     const labels = [`STRASSE ${suffix}`, `new ${suffix}`, `NEW ${suffix}`, `Straße ${suffix}`];
-    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels }, f.at)).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels }, f.at)).toMatchObject({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, receipt: expect.any(Object) });
     expect(await f.catalog.listArticleTags(f.id)).toHaveLength(2);
     expect((await database.pool.query('select label, manual_offset from tags where id=$1', [existingId])).rows[0]).toEqual({ label: `Straße ${suffix}`, manual_offset: 3 });
     expect((await database.pool.query('select value from tag_votes where article_id=$1 and tag_id=$2', [f.id, existingId])).rows).toEqual([{ value: 1 }]);
     const second = await f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 2, prerequisiteId: f.categoryTask.id, createdAt: f.at, updatedAt: f.at });
     const token = randomUUID(); await f.tasks.claimTask(second.id, token, f.at);
-    expect(await f.catalog.publishTagCandidate({ ...f.candidate, taskId: second.id, executionToken: token, generation: 2, assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, labels }, f.at)).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, taskId: second.id, executionToken: token, generation: 2, assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, labels }, f.at)).toMatchObject({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, receipt: expect.any(Object) });
   });
 
   it('keeps manual associations when publishing other tags', async () => {
@@ -599,7 +655,7 @@ describe('tag candidate publication', () => {
       manualId = manual.id;
       expect(await catalog.attachTag(id, manualId)).toBe(true);
     });
-    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels: [`generated-${randomUUID()}`] }, f.at)).toEqual({ assignmentRevision: 3, catalogEpoch: f.candidate.catalogEpoch + 1 });
+    expect(await f.catalog.publishTagCandidate({ ...f.candidate, labels: [`generated-${randomUUID()}`] }, f.at)).toMatchObject({ assignmentRevision: 3, catalogEpoch: f.candidate.catalogEpoch + 1, receipt: expect.any(Object) });
     const assigned = await f.catalog.listArticleTags(f.id);
     expect(assigned).toHaveLength(2);
     expect(assigned.some(tag => tag.id === manualId)).toBe(true);
@@ -694,7 +750,7 @@ describe('tag candidate publication', () => {
       const mutation = change === 'newer' ? f.tasks.createTask({ articleId: f.id, action: 'tags', generation: 2, state: 'failed', createdAt: f.at, updatedAt: f.at }) : f.edits[change === 'assignment' ? 'tag' : 'content']();
       await waitForLockWaiters(2);
       await blocker.query('commit');
-      expect(await publication).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1 });
+      expect(await publication).toMatchObject({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch + 1, receipt: expect.any(Object) });
       await mutation;
       expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'succeeded' });
     } finally { await blocker.query('rollback'); blocker.release(); }
@@ -712,7 +768,7 @@ describe('tag candidate publication', () => {
       const edit = f.catalog.changeTag(f.id, tag!.id, true);
       await waitForLockWaiters(2);
       await blocker.query('commit');
-      expect(await publication).toEqual({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch });
+      expect(await publication).toMatchObject({ assignmentRevision: 2, catalogEpoch: f.candidate.catalogEpoch, receipt: expect.any(Object) });
       expect(await edit).toBe('ok');
       expect(await f.article()).toMatchObject({ assignment_revision: 2 });
     } finally { await blocker.query('rollback'); blocker.release(); }
@@ -745,7 +801,7 @@ describe('tag candidate publication', () => {
       const mutation = change === 'create' ? second.catalog.createTag(`race-${randomUUID()}`) : second.catalog.archiveTag(other.id, second.at);
       await waitForLockWaiters(2);
       await taskBlocker.query('commit');
-      expect(await publication).toEqual({ assignmentRevision: 1, catalogEpoch: second.candidate.catalogEpoch });
+      expect(await publication).toMatchObject({ assignmentRevision: 1, catalogEpoch: second.candidate.catalogEpoch, receipt: expect.any(Object) });
       await mutation;
     } finally { await taskBlocker.query('rollback'); taskBlocker.release(); }
   }, 15000);
@@ -1048,4 +1104,23 @@ describe('direct score candidate publication', () => {
       expect(await f.tasks.getTask(f.task.id)).toMatchObject({ state: 'running' });
     } finally { await client.query('rollback'); client.release(); }
   }, 15000);
+});
+
+it('consumer-only real receipt tampering rejects a real kernel candidate and preserves the prior score', async () => {
+  const context = (await database.pool.query("insert into import_contexts(instance,account) values ($1,'test') returning id", [randomUUID()])).rows[0].id as string;
+  const target = (await database.pool.query("insert into score_definitions(name,description,prompt) values ($1,'','prompt') returning id", [randomUUID()])).rows[0].id as string;
+  await database.pool.query("update model_roles set provider='fake',model=case role when 'scores' then 'classifier' else 'generator' end where role in ('scores','context_reduction')");
+  const at = new Date(), f = await linkedScoreFixture(database, context, target, at), scores = new ScoreStore(database.db);
+  expect(await scores.saveSuccessful({ articleId: f.article, scoreId: target, value: 25, calculatedAt: at, contentRevision: 1, assignmentRevision: 0 })).toBe(true);
+  const prior = await scores.get(f.article, target), token = randomUUID(); await f.tasks.claimTask(f.score.id, token, at);
+  const classifier = { model: { provider: 'fake', model: 'classifier' }, limits: { contextTokens: 10000, outputTokens: 100, framingTokens: 1 }, countTokens: () => 1 };
+  const loaded = await new ScoreTaskInputStore(database.pool).loadResult(f.score.id, token, { classifier, generator: { ...classifier, model: { provider: 'fake', model: 'generator' } } }, new AbortController().signal);
+  if (loaded.kind !== 'loaded') throw new Error(`linked input: ${loaded.kind}`);
+  const ai = { classify: async () => ({ kind: 'completed' as const, value: { answers: { score: { type: 'score' as const, score: 4, confidence: 1, criteria: [] } }, usage: null } }), generate: async () => { throw new Error('unexpected generator'); }, createRestrictedSession: async () => { throw new Error('unexpected session'); } };
+  const result = await processContextChunks(loaded.input, ai);
+  if (result.kind !== 'completed') throw new Error(`linked kernel: ${result.kind}`);
+  await database.pool.query("update processing_tasks set result=result-'handoffReceipt' where id=$1", [f.tag.id]);
+  expect(await scores.publishCandidate(result.value, at)).toBe(false);
+  expect(await scores.get(f.article, target)).toEqual(prior);
+  expect(await f.tasks.getTask(f.score.id)).toMatchObject({ state: 'running' });
 });

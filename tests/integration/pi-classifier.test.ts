@@ -7,6 +7,7 @@ import { migrateDatabase } from '../../src/server/adapters/postgres/migrate.js';
 import { PostgresUsageAdmissionStore } from '../../src/server/adapters/postgres/usage-admission-store.js';
 import { createPiClassifier } from '../../src/server/adapters/pi/classifier.js';
 import { UsageService } from '../../src/server/application/usage.js';
+import { createArticleQualityClassifier } from '../../src/server/application/classify-article-quality.js';
 import { systemClock } from '../../src/server/domain/clock.js';
 import type { ClassificationRequest } from '../../src/server/ports/ai.js';
 import { createFakeProvider } from '../helpers/fake-provider.js';
@@ -119,6 +120,18 @@ describe('real Pi classifier and committed usage admission', () => {
     const result = await attempt;
     expect(result).toMatchObject({ kind: 'completed', value: { answers: { b: { type: 'bool', probability: 0.75 }, c: { choice: 'a' }, s: { score: 0.5, criteria: ['low', 'mid', 'high'] } }, usage: { inputTokens: 5, outputTokens: null, costUsd: null } } });
     expect(await ledger()).toMatchObject([{ status: 'succeeded', input_tokens: 5, output_tokens: null, tokens_source: 'provider', cost_usd: null, cost_source: 'unknown' }]);
+  });
+  it('routes the quality seam through Pi and records its preparation task', async () => {
+    // Fixture-only sizing; not evidence of a provider tokenizer or framing.
+    const quality = createArticleQualityClassifier(classifier, { model: request.model, limits: { contextTokens: 10000, outputTokens: 1, framingTokens: 1 }, countTokens: s => Buffer.byteLength(s) });
+    const before = fake.accepted;
+    const attempt = quality.classify({ text: 'fixture article', sourceUrl: 'https://example.com/article' }, new AbortController().signal, 'quality-fixture-task');
+    const received = await next(attempt);
+    expect((await db.pool.query('select status from usage_ledger where task_id=$1', ['quality-fixture-task'])).rows).toEqual([{ status: 'reserved' }]);
+    received.respond(200, { 'content-type': 'application/json' }, JSON.stringify({ answers: { usable: { type: 'noul', noul: 0.8 } }, usage: { input_tokens: 12 } }));
+    expect(await attempt).toEqual({ usable: true, probability: 0.8 });
+    expect((await db.pool.query('select status,input_tokens,output_tokens from usage_ledger where task_id=$1', ['quality-fixture-task'])).rows).toEqual([{ status: 'succeeded', input_tokens: 12, output_tokens: null }]);
+    expect(fake.accepted - before).toBe(1);
   });
   it('correlates concurrent Pi request markers with committed reservations and denies a third', async () => {
     await db.pool.query("update budget_settings set concurrency=2 where bucket='classifier'");

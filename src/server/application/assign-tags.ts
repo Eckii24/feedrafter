@@ -1,6 +1,6 @@
 import { normalizeTagLabel } from '../../shared/taxonomy.js';
 import type { TagTaskInputStore } from '../adapters/postgres/tag-task-input-store.js';
-import type { CatalogStore } from '../adapters/postgres/catalog-store.js';
+import type { TagCandidate, TagPublication } from '../adapters/postgres/catalog-store.js';
 import type { TaskStore } from '../adapters/postgres/task-store.js';
 import type { AiPort, GenerationRequest } from '../ports/ai.js';
 import { measureVerifiedRequest, type VerifiedModel } from './score-context-request.js';
@@ -9,7 +9,7 @@ import { UsageAbortError, UsageAttemptError } from './usage.js';
 type Result = { kind: 'published' | 'superseded' | 'paused_budget' | 'paused_auth' | 'needs_input' | 'failed' | 'ownership_lost' };
 type Dependencies = {
   inputs: Pick<TagTaskInputStore, 'loadResult'>;
-  catalog: Pick<CatalogStore, 'publishTagCandidate' | 'tagKeysFit'>;
+  catalog: { publishTagCandidate(candidate: TagCandidate, at: Date): Promise<TagPublication | null>; tagKeysFit(labels: string[]): Promise<boolean> };
   tasks: Pick<TaskStore, 'updateOwnedTask'>;
   ai: AiPort;
   model: VerifiedModel | null;
@@ -32,7 +32,8 @@ export async function assignTags(taskId: string, executionToken: string, { input
   if (loaded.kind === 'not_owned') return { kind: 'ownership_lost' };
   if (loaded.kind === 'stale_basis') return settle('superseded', 'stale_basis');
   if (loaded.kind !== 'loaded') return settle('needs_input', loaded.kind);
-  const { basis, title, category, content, generator } = loaded.input;
+  const { title, category, content, generator } = loaded.input;
+  const basis = structuredClone(loaded.input.basis);
   if (!content.trim() || basis.contentRevision <= 0) return settle('needs_input', 'missing_selected_content');
   const request: GenerationRequest = { model: generator.model, role: 'tags', system: 'Return only a JSON object with a tags array of at most 10 unique, nonblank tag labels appropriate for this article.', user: JSON.stringify({ title, category, content }) };
   try {
@@ -69,7 +70,7 @@ export async function assignTags(taskId: string, executionToken: string, { input
   } catch { return settle('failed', 'tag_validation_failure'); }
   // Publisher entry is the cutoff; do not overwrite an ambiguous committed success.
   if (signal.aborted) return settle('failed', 'cancelled_before_publication');
-  let published: Awaited<ReturnType<CatalogStore['publishTagCandidate']>>;
+  let published: TagPublication | null;
   try { published = await catalog.publishTagCandidate({ ...basis, labels }, now()); }
   catch { throw new Error('Tag publication failed'); }
   return published ? { kind: 'published' } : settle('superseded', 'stale_basis');

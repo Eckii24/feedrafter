@@ -6,6 +6,7 @@ import { migrateDatabase } from './adapters/postgres/migrate.js';
 import { provisionImportQueues } from './adapters/postgres/import-runner.js';
 import { KARAKEEP_QUEUE } from './adapters/postgres/karakeep-jobs.js';
 import { provisionScoreQueue } from './adapters/postgres/score-admission.js';
+import { provisionArticleQueues } from './adapters/postgres/article-worker.js';
 
 async function main() {
   const command = process.argv[2] ?? 'serve';
@@ -17,7 +18,7 @@ async function main() {
     boss.on('error', () => { console.error('Import queue error'); });
     try {
       const lock = await database.pool.connect();
-      try { await lock.query('select pg_advisory_lock($1, $2)', [18420, 2]); await migrateDatabase(database.pool); await boss.start(); await provisionImportQueues(boss); await boss.createQueue(KARAKEEP_QUEUE); await provisionScoreQueue(boss); }
+      try { await lock.query('select pg_advisory_lock($1, $2)', [18420, 2]); await migrateDatabase(database.pool); await boss.start(); await provisionImportQueues(boss); await boss.createQueue(KARAKEEP_QUEUE); await provisionScoreQueue(boss); await provisionArticleQueues(boss); }
       finally { try { await lock.query('select pg_advisory_unlock($1, $2)', [18420, 2]); } finally { lock.release(); } }
     } finally { await boss.stop().catch(() => {}); await database.close(); }
     return;

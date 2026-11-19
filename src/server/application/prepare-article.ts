@@ -7,7 +7,7 @@ import type { SourceFallbackPermission } from '../ports/source-fallback-permissi
 
 /** Ports are deliberately inert: no model, agent or production fallback is wired here. */
 export interface ArticleQualityClassifier {
-  classify(input: { text: string; sourceUrl: string }, signal: AbortSignal): Promise<unknown>;
+  classify(input: { text: string; sourceUrl: string }, signal: AbortSignal, taskId: string): Promise<unknown>;
 }
 export interface ArticleExtractionFallback {
   /** Trusted adapter must use only this fetch capability; no model/tool runtime is supplied here. */
@@ -72,7 +72,7 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
     const extracted = await extractHtml(response.body, signal, { contentType: type });
     if (ACCESS.test(extracted.pageText) || ACCESS.test(extracted.text)) throw new Error('access_denied');
     let result = { text: extracted.text.trim(), sourceUrl: finalUrl };
-    let quality = result.text ? assessment(await bounded(deps.classifier.classify(result, signal), signal)) : 'unusable';
+    let quality = result.text ? assessment(await bounded(deps.classifier.classify(result, signal, context.taskId), signal)) : 'unusable';
     let fromFallback = false;
     if (quality !== 'usable' && deps.fallback) {
       const permission = deps.permission;
@@ -123,7 +123,7 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
       if (!fetched.has(result.sourceUrl)) throw new Error('invalid_fallback');
       await authorizeTarget(result.sourceUrl, signal);
       if (ACCESS.test(result.text)) throw new Error('access_denied');
-      quality = assessment(await bounded(deps.classifier.classify(result, signal), signal));
+      quality = assessment(await bounded(deps.classifier.classify(result, signal, context.taskId), signal));
       fromFallback = true;
     }
     if (quality !== 'usable') throw new Error('content_' + quality);

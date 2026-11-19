@@ -1,4 +1,5 @@
 import type { ContextStore } from '../adapters/postgres/context-store.js';
+import type { ScoreHandoff } from '../adapters/postgres/score-handoff.js';
 import { generateScoreEvidence } from './generate-score-evidence.js';
 import type { AiOutcome, AiPort, JsonObject } from '../ports/ai.js';
 import { prepareContext, selectContext, type ContextInput, type ContextPlan } from './prepare-context.js';
@@ -7,7 +8,7 @@ export type { VerifiedModel } from './score-context-request.js';
 import { UsageAttemptError } from './usage.js';
 
 export type ScoreContextTask = Readonly<{
-  owner: Readonly<{ taskId: string; executionToken: string; assignmentRevision: number; catalogEpoch: number }>;
+  owner: Readonly<{ taskId: string; executionToken: string; assignmentRevision: number; catalogEpoch: number; handoff?: ScoreHandoff }>;
   scoreId: string;
   prompt: string;
   article: ContextInput['article'];
@@ -19,14 +20,14 @@ export type ScoreContextTask = Readonly<{
 }>;
 export type ScoreCandidate = Readonly<{
   value: number;
-  basis: Readonly<{ taskId: string; executionToken: string; scoreId: string; articleId: string; contentRevision: number; assignmentRevision: number; catalogEpoch: number; generation: number; condensed: false; limited: false }>;
+  basis: Readonly<{ taskId: string; executionToken: string; scoreId: string; articleId: string; contentRevision: number; assignmentRevision: number; catalogEpoch: number; generation: number; condensed: false; limited: false; handoff?: ScoreHandoff }>;
   coverage: ContextPlan['coverage'];
 }>;
 export type ScoreExecution = AiOutcome<ScoreCandidate> | { kind: 'unsupported_chunks' } | { kind: 'needs_input'; reason: 'missing_selected_content' } | Awaited<ReturnType<typeof generateScoreEvidence>>;
 
 /** Direct candidates or persisted evidence only. C14 must fence any publication. */
 export async function processContextChunks(inputTask: ScoreContextTask, ai: AiPort, store?: Pick<ContextStore, 'save' | 'resume' | 'claimRepair'>): Promise<ScoreExecution> {
-  const task = { ...inputTask, owner: { ...inputTask.owner }, article: structuredClone(inputTask.article), fields: { ...inputTask.fields }, classifier: { ...inputTask.classifier, model: { ...inputTask.classifier?.model }, limits: { ...inputTask.classifier?.limits } }, generator: { ...inputTask.generator, model: { ...inputTask.generator?.model }, limits: { ...inputTask.generator?.limits } } };
+  const task = { ...inputTask, owner: { ...inputTask.owner, ...(inputTask.owner.handoff ? { handoff: structuredClone(inputTask.owner.handoff) } : {}) }, article: structuredClone(inputTask.article), fields: { ...inputTask.fields }, classifier: { ...inputTask.classifier, model: { ...inputTask.classifier?.model }, limits: { ...inputTask.classifier?.limits } }, generator: { ...inputTask.generator, model: { ...inputTask.generator?.model }, limits: { ...inputTask.generator?.limits } } };
   if (!task.owner?.taskId?.trim() || !task.owner.executionToken?.trim() || !Number.isSafeInteger(task.owner.assignmentRevision) || task.owner.assignmentRevision < 0 || !Number.isInteger(task.owner.catalogEpoch) || task.owner.catalogEpoch < 0 || task.owner.catalogEpoch > 2147483647 || !task.scoreId?.trim() || !task.prompt?.trim() || !task.signal || typeof task.signal.addEventListener !== 'function') throw new RangeError('invalid score task');
   if (!task.article || typeof task.article.id !== 'string' || !task.article.id.trim() || !Number.isSafeInteger(task.article.contentRevision) || task.article.contentRevision < 0 || !Number.isSafeInteger(task.generation) || task.generation < 0 || typeof task.article.content !== 'string' || typeof task.fields?.includeContent !== 'boolean') throw new RangeError('invalid context identity');
   if (task.fields.includeContent && (!task.article.content.trim() || task.article.contentRevision === 0)) return { kind: 'needs_input', reason: 'missing_selected_content' };
@@ -57,5 +58,5 @@ export async function processContextChunks(inputTask: ScoreContextTask, ai: AiPo
   const answers = outcome.value.answers;
   const answer = answers?.score;
   if (!answers || Object.keys(answers).length !== 1 || !answer || answer.type !== 'score' || !Number.isFinite(answer.score) || answer.score < 0 || answer.score > 4) throw new RangeError('invalid native score index');
-  return { kind: 'completed', value: { value: 100 * answer.score / 4, basis: { taskId: task.owner.taskId, executionToken: task.owner.executionToken, scoreId: task.scoreId, articleId: task.article.id, contentRevision: task.article.contentRevision, assignmentRevision: task.owner.assignmentRevision, catalogEpoch: task.owner.catalogEpoch, generation: task.generation, condensed: false, limited: false }, coverage: plan.coverage } };
+  return { kind: 'completed', value: { value: 100 * answer.score / 4, basis: { taskId: task.owner.taskId, executionToken: task.owner.executionToken, scoreId: task.scoreId, articleId: task.article.id, contentRevision: task.article.contentRevision, assignmentRevision: task.owner.assignmentRevision, catalogEpoch: task.owner.catalogEpoch, generation: task.generation, condensed: false, limited: false, ...(task.owner.handoff ? { handoff: task.owner.handoff } : {}) }, coverage: plan.coverage } };
 }

@@ -152,6 +152,25 @@ it.each([null, 'not-a-uuid'])('rejects an invalid send result and rolls back its
   expect((await database.pool.query('select id from processing_tasks where article_id=$1', [article])).rows).toHaveLength(0);
 });
 
+it('rejects a different valid persisted job ID and rolls back the real job and supersession', async () => {
+  const previous = await admitted();
+  const before = (await database.pool.query('select * from processing_tasks where article_id=$1 order by id', [article])).rows;
+  const beforeJobs = await jobs();
+  const wrongId = randomUUID();
+  await database.pool.query(`create function substitute_score_job_id() returns trigger language plpgsql as $$ begin
+    if new.article_id = '${article}'::uuid and new.job_id is not null then new.job_id := '${wrongId}'::uuid; end if;
+    return new; end $$`);
+  await database.pool.query('create trigger substitute_score_job_id before update of job_id on processing_tasks for each row execute function substitute_score_job_id()');
+  const send = vi.spyOn(boss, 'send');
+  try {
+    await expect(admitted()).rejects.toThrow('Score job ID update failed');
+    expect(send).toHaveBeenCalledTimes(1);
+    expect((await database.pool.query('select * from processing_tasks where article_id=$1 order by id', [article])).rows).toEqual(before);
+    expect(await jobs()).toEqual(beforeJobs);
+    expect(previous).toHaveLength(2);
+  } finally { await database.pool.query('drop trigger substitute_score_job_id on processing_tasks; drop function substitute_score_job_id()'); }
+});
+
 it('rolls back jobs on post-send commit failure', async () => {
   await database.pool.query(`create function fail_score_commit() returns trigger language plpgsql as $$ begin if new.article_id = '${article}'::uuid then raise exception 'commit failure'; end if; return null; end $$`);
   await database.pool.query('create constraint trigger fail_score_commit after insert on processing_tasks deferrable initially deferred for each row execute function fail_score_commit()');

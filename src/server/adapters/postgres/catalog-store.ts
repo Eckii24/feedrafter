@@ -1,4 +1,4 @@
-import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { validateModelRoleSettings, type ModelRoleSettings } from "../../../shared/settings.js";
 import { validateScoreDefinition, type ScoreDefinitionInput } from "../../../shared/scores.js";
 import { fallbackCategoryId, normalizeTagLabel } from "../../../shared/taxonomy.js";
@@ -24,11 +24,15 @@ export type CategoryCandidate = {
 };
 
 export type CategoryPublication = { assignmentRevision: number; receipt: HandoffReceiptV1 };
+export type TagPublication = { assignmentRevision: number; catalogEpoch: number; receipt: HandoffReceiptV1 };
 
 export type TagCandidate = Omit<CategoryCandidate, 'prerequisiteId'> & {
   prerequisiteTaskId: string;
   prerequisiteGeneration: number;
   categoryPrerequisiteId: string | null;
+  articleInputHash: string;
+  prerequisiteReceipt: HandoffReceiptV1;
+  chainConsumer?: ChainMetadataV1;
   title: string | null;
   labels: string[];
 };
@@ -78,7 +82,7 @@ const scoreFields: (keyof ScoreDefinitionInput)[] = ['name', 'description', 'pro
 export class CatalogCollision extends Error {}
 
 export class CatalogStore {
-  constructor(private readonly db: Database) {}
+  constructor(protected readonly db: Database) {}
 
   listCategories() { return this.db.select().from(categories); }
   async createCategory(label: string) {
@@ -214,7 +218,15 @@ export class CatalogStore {
   }
   tagKeysFit(labels: string[]) { return tagKeysFit(this.db, labels); }
 
-  async publishTagCandidate(candidate: TagCandidate, at: Date): Promise<{ assignmentRevision: number; catalogEpoch: number } | null> {
+  protected async lockTagTargets(tx: Transaction, candidate: TagCandidate, at: Date): Promise<boolean> {
+    const labels = normalizedCandidateLabels(candidate, at);
+    if (!labels) return false;
+    if (labels.length) await tx.select({ id: tags.id }).from(tags)
+      .where(or(...labels.map(label => sql`${tags.key} = ${tagKey(sql`${label}::text`)}`))).orderBy(tags.id).for('update');
+    return true;
+  }
+
+  async publishTagCandidate(candidate: TagCandidate, at: Date): Promise<TagPublication | null> {
     if (!normalizedCandidateLabels(candidate, at)) return null;
     try {
       return await this.db.transaction(tx => this.publishTagCandidateInTransaction(tx, candidate, at));
@@ -225,7 +237,12 @@ export class CatalogStore {
   }
 
   // RejectTagCandidate must escape the transaction before being translated to null.
-  async publishTagCandidateInTransaction(tx: Transaction, candidate: TagCandidate, at: Date): Promise<{ assignmentRevision: number; catalogEpoch: number } | null> {
+  async publishTagCandidateInTransaction(tx: Transaction, candidate: TagCandidate, at: Date): Promise<TagPublication | null> {
+    return this.publishTagCandidateInternal(tx, candidate, at, false);
+  }
+
+  /** Linked mode is reserved for the owning handoff transaction in ArticleJobs. */
+  protected async publishTagCandidateInternal(tx: Transaction, candidate: TagCandidate, at: Date, linked: boolean): Promise<TagPublication | null> {
     const labels = normalizedCandidateLabels(candidate, at);
     if (!labels) return null;
     {
@@ -234,13 +251,18 @@ export class CatalogStore {
         const [epoch] = await tx.select().from(catalogEpoch).where(eq(catalogEpoch.id, 1)).for('update');
         if (!epoch || epoch.revision !== candidate.catalogEpoch) return null;
         const [article] = await tx.select().from(articles).where(eq(articles.id, candidate.articleId)).for('update');
-        if (!article || article.title !== candidate.title || article.categoryId !== candidate.categoryId.toLowerCase() || article.contentRevision !== candidate.contentRevision || article.assignmentRevision !== candidate.assignmentRevision) return null;
+        if (!article || article.title !== candidate.title || articleFingerprint(article.title, article.sourceId) !== candidate.articleInputHash || article.categoryId !== candidate.categoryId.toLowerCase() || article.contentRevision !== candidate.contentRevision || article.assignmentRevision !== candidate.assignmentRevision) return null;
         const [task] = await tx.select().from(processingTasks).where(eq(processingTasks.id, candidate.taskId)).for('update');
         if (!task || task.articleId !== article.id || task.action !== 'tags' || task.state !== 'running' ||
             task.executionToken !== candidate.executionToken.toLowerCase() || task.generation !== candidate.generation ||
             task.prerequisiteId !== candidate.prerequisiteTaskId.toLowerCase()) return null;
         const [prerequisite] = await tx.select().from(processingTasks).where(eq(processingTasks.id, candidate.prerequisiteTaskId)).for('share');
         if (!prerequisite || prerequisite.articleId !== article.id || prerequisite.action !== 'category' || prerequisite.state !== 'succeeded' || prerequisite.generation !== candidate.prerequisiteGeneration || prerequisite.prerequisiteId !== (candidate.categoryPrerequisiteId?.toLowerCase() ?? null)) return null;
+        // A missing child namespace cannot turn a chain root into standalone work.
+        if (!linked && ((task.result && Object.hasOwn(task.result, 'articleChain')) ||
+            (prerequisite.result && Object.hasOwn(prerequisite.result, 'articleChain')) || candidate.chainRoot || candidate.chainConsumer)) return null;
+        const categoryReceipt = readHandoffReceipt(prerequisite.result);
+        if (!categoryReceipt || categoryReceipt.action !== 'category' || categoryReceipt.taskId.toLowerCase() !== prerequisite.id || categoryReceipt.articleId.toLowerCase() !== article.id || categoryReceipt.generation !== prerequisite.generation || (categoryReceipt.prerequisiteId?.toLowerCase() ?? null) !== prerequisite.prerequisiteId || JSON.stringify(categoryReceipt) !== JSON.stringify(candidate.prerequisiteReceipt)) return null;
         if (prerequisite.prerequisiteId !== null) {
           const [prepare] = await tx.select().from(processingTasks).where(eq(processingTasks.id, prerequisite.prerequisiteId)).for('share');
           if (!prepare || prepare.articleId !== article.id || prepare.action !== 'prepare' || prepare.state !== 'succeeded') return null;
@@ -274,9 +296,13 @@ export class CatalogStore {
           await advanceEpoch(tx);
           resultEpoch++;
         }
-        const updated = await tx.update(processingTasks).set({ state: 'succeeded', errorCode: null, updatedAt: at, endedAt: at }).where(eq(processingTasks.id, task.id)).returning({ id: processingTasks.id });
-        if (updated.length !== 1) throw new Error('Tag task success update failed');
-        return { assignmentRevision, catalogEpoch: resultEpoch };
+        const receipt = decodeHandoffReceiptV1({ version: 1, taskId: task.id, generation: task.generation, action: 'tags', articleId: article.id,
+          prerequisiteId: task.prerequisiteId, categoryId: article.categoryId, basis: { contentRevision: article.contentRevision, assignmentRevision,
+            articleInputHash: articleFingerprint(article.title, article.sourceId) }, catalogEpoch: resultEpoch });
+        if (!receipt) throw new Error('Invalid tag receipt');
+        const updated = await tx.update(processingTasks).set({ state: 'succeeded', result: { ...task.result, handoffReceipt: receipt }, errorCode: null, updatedAt: at, endedAt: at }).where(eq(processingTasks.id, task.id)).returning({ id: processingTasks.id, state: processingTasks.state, result: processingTasks.result });
+        if (updated.length !== 1 || updated[0]?.state !== 'succeeded' || JSON.stringify(readHandoffReceipt(updated[0]?.result)) !== JSON.stringify(receipt)) throw new Error('Tag task success update failed');
+        return { assignmentRevision, catalogEpoch: resultEpoch, receipt };
     }
   }
   async setCategory(articleId: string, categoryId: string): Promise<AssignmentResult> {
