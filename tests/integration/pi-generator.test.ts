@@ -122,6 +122,16 @@ describe('real Pi generation with a single verified TLS send', () => {
     expect((await ledger()).at(-1)).toMatchObject({ status: 'succeeded', input_tokens: 4, output_tokens: null, tokens_source: 'provider', cost_usd: null, cost_source: 'unknown' });
     expect(accepted - before).toBe(1);
   });
+  it('still rejects Pi thinking blocks on the OpenAI route', async () => {
+    const before = accepted; const attempt = generator.generate(request, scope());
+    const rejection = expect(attempt).rejects.toMatchObject({ kind: 'uncertain' });
+    const received = await next();
+    const reasoning = { type: 'reasoning', id: 'rs_fixture', summary: [{ type: 'summary_text', text: 'private' }] };
+    reply(received.response, event({ type: 'response.output_item.added', output_index: 0, item: reasoning })
+      + event({ type: 'response.output_item.done', output_index: 0, item: reasoning }) + start + terminal({ input_tokens: 3, output_tokens: 2 }) + done);
+    await rejection; expect(accepted - before).toBe(1);
+    expect((await ledger()).at(-1)).toMatchObject({ status: 'uncertain', input_tokens: 3, output_tokens: 2 });
+  });
   it.each([{ usage: { input_tokens: 0, output_tokens: 0 }, expected: { inputTokens: 0, outputTokens: 0, costUsd: null }, source: 'provider' }, { usage: undefined, expected: null, source: 'unknown' }, { usage: { input_tokens: 'bad', output_tokens: -1 }, expected: null, source: 'unknown' }])('preserves only valid wire usage %#', async ({ usage, expected, source }) => {
     const attempt = generator.generate(request, scope()); const received = await next(); reply(received.response, start + terminal(usage) + done);
     expect(await attempt).toMatchObject({ kind: 'completed', value: { usage: expected } }); expect((await ledger()).at(-1)).toMatchObject({ status: 'succeeded', tokens_source: source });

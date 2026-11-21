@@ -153,13 +153,10 @@ it('admits through HTTP and completes only active targets; normal composition st
       expect(createQueue.mock.calls.map(([queue]) => queue)).not.toContain(name);
       expect(work.mock.calls.map(([queue]) => queue)).not.toContain(name);
     }
-    expect(work.mock.calls.map(([name]) => name)).toContain(SCORE_QUEUE);
+    expect(createQueue.mock.calls.map(([name]) => name)).not.toContain(SCORE_QUEUE);
+    expect(work.mock.calls.map(([name]) => name)).not.toContain(SCORE_QUEUE);
     const result = await application.app.inject({ method: 'POST', url: `/api/v1/articles/${f.article}/reevaluations`, headers, payload: {} });
-    expect(result.statusCode).toBe(202);
-    const id = result.json().tasks[0].taskId;
-    await eventually(async () => (await new TaskStore(database.db).getTask(id))?.state === 'needs_input');
-    const status = await application.app.inject({ url: `/api/v1/processing-tasks/${id}`, headers });
-    expect(status.json()).toMatchObject({ id, action: 'scores', state: 'needs_input', errorCode: 'configuration_required', endedAt: null });
+    expect(result.statusCode).toBe(503);
     expect(runtime).not.toHaveBeenCalled(); expect(fetchSpy).not.toHaveBeenCalled();
   } finally {
     try { await application?.close(); }

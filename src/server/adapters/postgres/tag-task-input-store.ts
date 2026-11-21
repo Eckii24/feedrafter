@@ -1,5 +1,5 @@
 import type pg from 'pg';
-import { validateVerifiedModel, type VerifiedModel } from '../../application/score-context-request.js';
+import { copyRequestModel, validateRequestModel, type RequestModel } from '../../application/score-context-request.js';
 import type { TagCandidate } from './catalog-store.js';
 import { articleFingerprint, readChainMetadata, readHandoffReceipt, readPreparationReceipt } from '../../domain/article-handoff.js';
 
@@ -8,7 +8,7 @@ export type TagTaskInput = {
   title: string | null;
   category: string;
   content: string;
-  generator: VerifiedModel;
+  generator: RequestModel;
 };
 export type TagInputResult = { kind: 'loaded'; input: TagTaskInput } | { kind: 'stale_basis' | 'not_owned' | 'configuration_required' | 'prerequisite_required' | 'missing_selected_content' | 'content_not_usable' | 'content_revision_mismatch' | 'invalid_handoff' };
 
@@ -16,11 +16,11 @@ export type TagInputResult = { kind: 'loaded'; input: TagTaskInput } | { kind: '
 export class TagTaskInputStore {
   constructor(private readonly pool: pg.Pool) {}
 
-  async loadResult(taskId: string, executionToken: string, model: VerifiedModel | null, signal: AbortSignal): Promise<TagInputResult> {
+  async loadResult(taskId: string, executionToken: string, model: RequestModel | null, signal: AbortSignal): Promise<TagInputResult> {
     const uuid = (v: unknown) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     if (!uuid(taskId) || !uuid(executionToken) || !signal || typeof signal.addEventListener !== 'function') return { kind: 'not_owned' };
-    let generator: VerifiedModel | null = null;
-    try { if (model) { validateVerifiedModel(model); generator = { ...model, model: { ...model.model }, limits: { ...model.limits } }; } } catch { /* Configuration is not ownership. */ }
+    let generator: RequestModel | null = null;
+    try { if (model) { validateRequestModel(model); generator = copyRequestModel(model); } } catch { /* Configuration is not ownership. */ }
     const client = await this.pool.connect();
     try {
       await client.query('begin isolation level read committed');

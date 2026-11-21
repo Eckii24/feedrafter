@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { ModelsError } from '@earendil-works/pi-ai';
+import { ModelsError, type CredentialStore } from '@earendil-works/pi-ai';
 import { UsageService, type InvokeResult } from '../../application/usage.js';
 import type { TerminalUsage } from '../../domain/usage.js';
 import type { AiOutcome, ClassificationResult, GenerationResult } from '../../ports/ai.js';
@@ -24,15 +24,28 @@ let runtime: Promise<ModelRuntime> | undefined;
 const authEvidence = new AsyncLocalStorage<{ failed: boolean; oauth?: boolean }>();
 function createPiRuntime(): Promise<ModelRuntime> {
   return runtime ??= ModelRuntime.create({ ...runtimeOptions }).then((created) => {
+    // Pi 1.4's writable AuthStorage.read executes !commands. Read raw credentials
+    // under its existing lock instead; keep Pi's own modify path for OAuth rotation.
+    // This private shape is pinned to Pi 1.4 and must fail closed if it changes.
+    const store = (created as unknown as { credentials?: { store?: CredentialStore } }).credentials?.store;
+    if (!store || typeof store.modify !== 'function' || typeof store.read !== 'function') throw new Error('Unsupported Pi credential storage');
+    store.read = async (provider, options) => {
+      const credential = await store.modify(provider, async () => undefined, options);
+      if (credential?.type === 'api_key' && credential.key?.startsWith('!')) throw new Error('Command credentials are disabled');
+      return credential;
+    };
     // Pi flattens setup errors into response text. Capture only typed auth evidence
     // within the current admitted attempt, before Pi converts the exception.
     const original = created.getAuth.bind(created);
     created.getAuth = (async (...args: Parameters<ModelRuntime['getAuth']>) => {
       try {
-        const result = await original(...args);
+        const provider = typeof args[0] === 'string' ? args[0] : args[0].provider;
+        const key = provider === 'typesafe' ? process.env.TYPESAFE_API_KEY : undefined;
+        const overrides = { ...args[1], ...(key === undefined ? {} : { apiKey: key }) };
+        const result = typeof args[0] === 'string' ? await original(args[0], overrides) : await original(args[0], overrides);
         const evidence = authEvidence.getStore();
         if (!result) { if (evidence) evidence.failed = true; }
-        else if (evidence) evidence.oauth = result.source === 'OAuth' && typeof result.auth.apiKey === 'string' && !result.auth.apiKey.startsWith('sk-');
+        else if (evidence && (typeof args[0] === 'string' ? args[0] : args[0].provider) === 'openai') evidence.oauth = result.source === 'OAuth' && typeof result.auth.apiKey === 'string' && !result.auth.apiKey.startsWith('sk-');
         return result;
       } catch (error) {
         if (error instanceof ModelsError && (error.code === 'oauth' || error.code === 'auth')) {
@@ -277,6 +290,7 @@ export async function createPiSessionFactory(mappings: readonly ModelRoleSetting
 }
 
 const generatorRoute = 'https://api.openai.com/v1/responses';
+const codexRoute = 'https://chatgpt.com/backend-api/codex/responses';
 const inputTokensRoute = 'https://api.openai.com/v1/responses/input_tokens';
 const maxInputBytes = 256 * 1024;
 const maxResponseBytes = 1024 * 1024;
@@ -335,8 +349,17 @@ export async function createPiInputTokenCounter(usage: UsageService, mappings: r
   });
 }
 
+/** Dormant direct Codex capability; not wired into application composition. */
+export function createPiCodexGenerator(usage: UsageService, mappings: readonly ModelRoleSettings[]) {
+  return createGenerator(usage, mappings, 'codex');
+}
+
 /** One bounded generation attempt. Pi models and provider controls remain private. */
-export async function createPiGenerator(usage: UsageService, mappings: readonly ModelRoleSettings[]): Promise<{
+export function createPiGenerator(usage: UsageService, mappings: readonly ModelRoleSettings[]) {
+  return createGenerator(usage, mappings, 'openai');
+}
+
+async function createGenerator(usage: UsageService, mappings: readonly ModelRoleSettings[], provider: 'openai' | 'codex'): Promise<{
   generate(request: GenerationRequest, scope: AiScope): Promise<AiOutcome<GenerationResult>>;
 }> {
   const runtime = await createPiRuntime();
@@ -349,8 +372,11 @@ export async function createPiGenerator(usage: UsageService, mappings: readonly 
       const selection = selectPhysicalModel(runtime, roles, request.model, request.role, scope, 'generation');
       if (selection.kind !== 'generation') throw new RangeError('Unsupported generation model');
       const model = selection.model;
-      if (model.provider !== 'openai' || model.id !== 'gpt-4.1-mini' || model.api !== 'openai-responses'
-        || new URL('responses', `${model.baseUrl.replace(/\/+$/u, '')}/`).href !== generatorRoute) throw new RangeError('Unsupported generation route');
+      const route = provider === 'codex' ? codexRoute : generatorRoute;
+      if (provider === 'codex'
+        ? model.provider !== 'openai-codex' || model.id !== 'gpt-6-luna' || model.api !== 'openai-codex-responses' || model.baseUrl !== 'https://chatgpt.com/backend-api'
+        : model.provider !== 'openai' || model.id !== 'gpt-4.1-mini' || model.api !== 'openai-responses'
+          || new URL('responses', `${model.baseUrl.replace(/\/+$/u, '')}/`).href !== generatorRoute) throw new RangeError('Unsupported generation route');
       const auth = await preflightConfiguredAuth(runtime, model.provider);
       if (auth !== 'configured') return { kind: auth };
       const result = await usage.executeAttempt(selection.intent, scope, async (signal, permit): Promise<InvokeResult<GenerationResult>> => {
@@ -361,7 +387,7 @@ export async function createPiGenerator(usage: UsageService, mappings: readonly 
         let inputTokens: number | null = null;
         let outputTokens: number | null = null;
         let drain: Promise<void> | undefined;
-        const send = createSingleSendFetch({ url: generatorRoute, permit, signal, timeoutMs, maxResponseBytes });
+        const send = createSingleSendFetch({ url: route, permit, signal, timeoutMs, maxResponseBytes });
         const fetch: typeof globalThis.fetch = async (url, init) => {
           // Pi/OpenAI aborts its private request signal when it stops parsing a
           // failed event. The attempt signal and transport timeout still govern
@@ -383,13 +409,13 @@ export async function createPiGenerator(usage: UsageService, mappings: readonly 
                 let raw: Record<string, unknown> | undefined;
                 try { raw = generationRecord(JSON.parse(payload)); } catch { malformedStream = true; return; }
                 if (!raw) { malformedStream = true; return; }
-                if (raw.type !== 'response.completed' && raw.type !== 'response.incomplete' && raw.type !== 'response.failed') return;
+                if (raw.type !== 'response.completed' && raw.type !== 'response.incomplete' && raw.type !== 'response.failed' && !(provider === 'codex' && raw.type === 'response.done')) return;
                 terminalCount++;
                 const wireResponse = generationRecord(raw.response);
-                const expected = raw.type.slice('response.'.length);
+                const expected = raw.type === 'response.done' ? wireResponse?.status : raw.type.slice('response.'.length);
                 if (wireResponse?.status === expected && (expected === 'completed' || expected === 'incomplete' || expected === 'failed')) {
                   terminalStatus = expected;
-                  const wire = generationRecord(wireResponse.usage);
+                  const wire = generationRecord(wireResponse?.usage);
                   inputTokens = count(wire?.input_tokens); outputTokens = count(wire?.output_tokens);
                 } else terminalStatus = undefined;
               };
@@ -408,7 +434,9 @@ export async function createPiGenerator(usage: UsageService, mappings: readonly 
           onPayload(payload) {
             const raw = generationRecord(payload);
             // Only Pi's confirmed OAuth path may omit the field; API keys must carry the cap.
-            if (raw?.model !== 'gpt-4.1-mini' || raw.stream !== true || (raw.max_output_tokens !== 4096 && !(raw.max_output_tokens === undefined && evidence.oauth === true)) || raw.tools !== undefined) throw new Error('Unsupported generation payload');
+            if (raw?.model !== model.id || raw.stream !== true || raw.tools !== undefined || (provider === 'codex'
+              ? raw.store !== false || raw.max_output_tokens !== undefined
+              : raw.max_output_tokens !== 4096 && !(raw.max_output_tokens === undefined && evidence.oauth === true))) throw new Error('Unsupported generation payload');
           },
         }).result().catch(() => undefined));
         await drain;
@@ -419,7 +447,12 @@ export async function createPiGenerator(usage: UsageService, mappings: readonly 
         if (send.bodyCompleted && !malformedStream && terminalCount === 1 && !signal.aborted && (terminalStatus === 'failed' || terminalStatus === 'incomplete')) {
           return { kind: 'failure', failureKind: 'provider', terminal: { ...known, status: 'failed', outcomeCode: 'provider_error' } };
         }
-        if (!send.bodyCompleted || malformedStream || terminalStatus !== 'completed' || terminalCount !== 1 || !response || response.stopReason !== 'stop' || response.errorMessage || response.content.some((item) => item.type !== 'text')) {
+        if (!send.bodyCompleted || malformedStream || terminalStatus !== 'completed' || terminalCount !== 1 || !response || response.stopReason !== 'stop' || response.errorMessage || response.content.some((item) => {
+          if (item.type === 'text') return false;
+          return provider !== 'codex' || item.type !== 'thinking' || typeof item.thinking !== 'string'
+            || (item.thinkingSignature !== undefined && typeof item.thinkingSignature !== 'string')
+            || Object.keys(item).some((key) => key !== 'type' && key !== 'thinking' && key !== 'thinkingSignature');
+        })) {
           return { kind: 'uncertain', terminal: { ...known, status: 'uncertain', outcomeCode: 'outcome_unknown' } };
         }
         const text = response.content.map((item) => item.type === 'text' ? item.text : '').join('');

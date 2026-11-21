@@ -6,3 +6,6 @@ test-results/
 .env
 .env.*
 !.env.example
+!.env.local.example
+compose.local.freshrss.yaml
+compose.local.pi.yaml

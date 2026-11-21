@@ -1,8 +1,64 @@
 # Feedrafter
 
-D1 is a private, same-origin reader for durably imported FreshRSS metadata. Node serves the reader and API together; PostgreSQL is external. No application login exists. **Never expose this service publicly:** a private VPN/network, HTTPS termination and access controls are operator prerequisites.
+D1 is a private, same-origin reader for durably imported FreshRSS metadata. Node serves the reader and API together; production Compose uses external PostgreSQL. No application login exists. **Never expose this service publicly:** a private VPN/network, HTTPS termination and access controls are operator prerequisites.
 
 See [operations](docs/operations.md) for setup, migrations, security, health, backup and restore; [API reference](docs/api.md) and [server configuration](docs/server-api.md) for D1 behavior; and [verification](docs/verification.md) for actual evidence and outstanding gates. FreshRSS acknowledgement is hard-disabled; no live provider is required for normal tests.
+
+## Local Docker Compose
+
+Requires Docker Compose, a running Docker daemon and OpenSSL. From the repository root, create a private local configuration with a unique URL-safe database password, then build, start PostgreSQL, explicitly migrate and start the app:
+
+```sh
+if [ ! -e .env.local ]; then
+  umask 077
+  cp .env.local.example .env.local
+  printf '\nLOCAL_DB_PASSWORD=%s\n' "$(openssl rand -hex 24)" >> .env.local
+  chmod 600 .env.local
+fi
+docker compose --env-file .env.local -f compose.local.yaml build
+docker compose --env-file .env.local -f compose.local.yaml up -d --wait postgres
+docker compose --env-file .env.local -f compose.local.yaml run --rm --no-deps app migrate
+docker compose --env-file .env.local -f compose.local.yaml up -d --wait app
+```
+
+Open <http://127.0.0.1:3000/>; readiness is at <http://127.0.0.1:3000/api/v1/health/ready>. Set `LOCAL_APP_PORT` in `.env.local` before startup if port 3000 is occupied, and use that port in the browser. Only loopback is published; PostgreSQL has no host port. Do not proxy or expose the app publicly: it has no login. Docker administrators can read container environment variables, volumes and credentials; keep `.env.local` private and do not publish `docker compose config` output.
+
+Stop and remove containers and the network, **without deleting data**, with:
+
+```sh
+docker compose --env-file .env.local -f compose.local.yaml down
+```
+
+The default Compose project is `feedrafter-local`, separate from the deployment Compose project. The named `db` and `data` volumes persist across shutdowns. Keep `.env.local`: changing the password there does not change an existing PostgreSQL volume's password. Back up both volumes together while all writers are stopped, and back up before upgrades; see [operations](docs/operations.md#backup-and-restore) for the matched-backup principles. Before migrating an existing installation, stop the app, take a matched backup, rebuild and run the explicit migration above; do not run concurrent migrations. `serve` never migrates. Do not use `down --volumes` unless deliberately deleting all local data.
+
+FreshRSS is disabled by default. To supply your own configuration, create an **untracked, private** `compose.local.freshrss.yaml` override containing the following (replace no values in the YAML):
+
+```yaml
+services:
+  app:
+    environment:
+      FRESHRSS_ENABLED: "true"
+      FRESHRSS_BASE_URL: ${FRESHRSS_BASE_URL:?Set FreshRSS URL}
+      FRESHRSS_EMAIL: ${FRESHRSS_EMAIL:?Set FreshRSS account}
+      FRESHRSS_API_PASSWORD_FILE: /run/secrets/freshrss-password
+    volumes:
+      - type: bind
+        source: ${FRESHRSS_PASSWORD_PATH:?Set absolute password file path}
+        target: /run/secrets/freshrss-password
+        read_only: true
+        bind:
+          create_host_path: false
+```
+
+Add `FRESHRSS_BASE_URL`, `FRESHRSS_EMAIL` and absolute `FRESHRSS_PASSWORD_PATH` values to `.env.local`; the existing password file must be readable by container UID 1000 and protected from other users. Use HTTPS for remote FreshRSS. Container `localhost` is not the host. Start with the extra override after migration:
+
+```sh
+docker compose --env-file .env.local -f compose.local.yaml -f compose.local.freshrss.yaml up -d --wait app
+```
+
+Enabling FreshRSS can immediately scan the entire unread backlog. Read acknowledgements remain disabled. To disable scheduled imports before enabling FreshRSS, run the PATCH command in [the manual-scan instructions](#optional-connect-freshrss-for-metadata-import) against the already-running local Compose app, then stop it with `docker compose --env-file .env.local -f compose.local.yaml stop app` before starting with the override. Do not use a real account for tests.
+
+Normal serving does not enable inference. For the optional local-only activation and its safety prerequisites, see [local processing](#local-processing-opt-in). Never bake credentials into the image or commit them.
 
 ## Local development
 
@@ -28,7 +84,7 @@ Open <http://127.0.0.1:3000/>. Health endpoints: <http://127.0.0.1:3000/api/v1/h
 docker compose -f compose.test.yaml down
 ```
 
-The database uses temporary storage; stopping it deletes its data. Normal serve does not register category/tag workers; its score worker remains fail-closed and no inference provider is activated. A separate test-only fixture exercises synthetic preparation → category → tags → original scores through real PostgreSQL/PgBoss and fake AI, then reads persisted results in the built browser. It is not automatic import, recovery, live inference, or a production activation.
+The database uses temporary storage; stopping it deletes its data. Normal serve registers no inference workers and activates no inference provider. A separate test-only fixture exercises synthetic preparation → category → tags → original scores through real PostgreSQL/PgBoss and fake AI, then reads persisted results in the built browser. It is not automatic import, recovery, live inference, or a production activation.
 
 ### Optional: connect FreshRSS for metadata import
 
@@ -61,13 +117,37 @@ curl -fsS http://127.0.0.1:3000/api/v1/pipeline/runs/YOUR-RUN-ID
 
 Imported metadata appears in the reader. The disabled scheduling setting persists in the database; manual runs still work. Do not use these example credentials or URLs literally. The local test database is deleted when stopped.
 
-### Pi and processing status
+### Local processing opt-in
 
-There is currently **no supported serve configuration or CLI** that connects Pi to the article workers, and FreshRSS import does not start preparation or article admission. Setting Pi/provider credentials or model roles alone does not enable inference. The existing Pi adapters have narrowly supported provider routes and usage admission, but production composition still needs verified model/token sizing and framing, safe budgets, preparation scheduling and recovery before it can be activated safely. No live model calls or live FreshRSS acceptance were performed here.
+**Local experiment only, not a production safety boundary.** Use a dedicated, initially empty processing database; run exactly one app instance and no external database writers for its entire lifetime. The operator must enforce this exclusive ownership. Workers consume shared queues, not just requested IDs. Startup checks that category, tags and score queues are provisioned and contain no pending, scheduled, retrying or active jobs; missing/nonempty queues refuse startup. This is only a point-in-time preflight, **not** a lock or protection against concurrent or malicious producers. Stop and investigate pending work; do not silently delete it. A previously used database or a second app invalidates the prerequisite even if the preflight passes.
 
-The unwired `createArticleQualityClassifier` seam maps preparation quality checks to an admitted classifier call associated with the preparation task. It requires caller-supplied verified model sizing and framing; its fixture token counter is not suitable for real use. The pinned Pi catalog lists `openai-codex/gpt-6-luna`, but not `openai-codex/gpt-6.1-terra`. The existing generator does not support the Codex route, and Pi's Codex request builder does not apply its `maxTokens` option. Pi auth is currently fixed to `/data/pi-auth/auth.json`; custom Pi `models.json` and its credential commands are not loaded. Do not treat credentials or model configuration as activation.
+The opt-in uses TypeSafe `typesafe/jev-latest` for quality, category and scores, and Codex `openai-codex/gpt-6-luna` for tags and context reduction. The request policy deliberately uses unverified UTF-8 JSON byte size (20,000 bytes maximum; assumed 32,000 context, 4,096 output and 1,024 framing). One byte per token and the reserves are assumptions, not verified tokenization, provider framing or a guarantee against context overflow. Pi's Codex builder does **not** enforce an output-token cap. Subscription usage and cost are unknown; request caps are not cost limits. Classifier and automatic buckets each have explicit daily and concurrent request caps, further constrained by the database budgets; zero disables dispatch. Usage may be recorded as unknown, and interrupted calls may be uncertain. No real provider acceptance has been established.
 
-A private code-level seam, `processExplicitArticles` in `src/server/adapters/postgres/explicit-article-processing.ts`, accepts 1–20 distinct explicit article IDs and injected web/quality-classifier dependencies. It prepares eligible first-time articles sequentially and uses the existing transactional admission to queue the category → tags → scores chain. It does not provision queues, register workers, scan a backlog, retry or recover. The caller must provision queues, supply safe dependencies, explicitly manage existing workers and their shutdown, and inspect results. Existing workers consume their shared queues, not just these IDs; do not start them against an uncontrolled backlog. Existing content or any prior preparation/category/tag/score task makes an article ineligible for this first-time seam. A crash, cancellation, or admission error can leave a running or completed preparation without a chain; no automatic takeover or retry is provided. An exception stops the batch and can leave earlier articles processed; inspect persisted tasks before any further action. This is an integration seam, not a supported live activation.
+For Compose, start with the empty dedicated `feedrafter-local` database, migrate and run the app disabled using the commands above. Keep it private and do not start a second app or writer. Copy your own Pi Codex OAuth `auth.json` and TypeSafe API key from private local files into the app-owned volume (never commit them or include them in shell arguments):
+
+```sh
+docker compose --env-file .env.local -f compose.local.yaml exec -T app sh -c 'umask 077; mkdir -p /data/pi-auth; chmod 700 /data/pi-auth; cat > /data/pi-auth/auth.json' < /absolute/path/to/your/pi-auth.json
+docker compose --env-file .env.local -f compose.local.yaml exec -T app sh -c 'umask 077; cat > /data/pi-auth/typesafe-key' < /absolute/path/to/your/typesafe-key
+```
+
+The directory and `auth.json` must be owned by the app user, private and writable, including the parent for OAuth rotation; the key file must be owner-only. `/data` persists secrets: protect and back up the volume accordingly. Custom `models.json` and Pi credential commands are not loaded. The OAuth file must already contain valid Codex credentials; refresh may write rotated credentials. No credentials or providers are supplied by this project.
+
+Stop the app, then set the model roles in the dedicated database and explicitly acknowledge the risks and choose caps in `.env.local` (see `.env.local.example`; remove the `#` and select your own limits):
+
+```sh
+docker compose --env-file .env.local -f compose.local.yaml stop app
+docker compose --env-file .env.local -f compose.local.yaml exec -T postgres psql -v ON_ERROR_STOP=1 -U feedrafter -d feedrafter -c "update model_roles set provider='typesafe', model='jev-latest', fallback_provider=null, fallback_model=null where role in ('quality','category','scores'); update model_roles set provider='openai-codex', model='gpt-6-luna', fallback_provider=null, fallback_model=null where role in ('tags','context_reduction');"
+docker compose --env-file .env.local -f compose.local.yaml up -d --force-recreate --wait app
+```
+
+No inference starts merely by enabling the app or importing metadata. Explicitly select an eligible, first-time article by replacing `ARTICLE-UUID` with its imported ID:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:3000/api/v1/articles/ARTICLE-UUID/processing \
+  -H 'Content-Type: application/json' -d '{}'
+```
+
+Normal disabled mode returns 503. The endpoint fetches public web content, sends it to the providers and admits category → tags → active scores. Review privacy and provider terms before use. Existing content or any prior prepare/category/tag/score task makes the article ineligible. A crash, cancellation, budget denial or admission error can leave partial work; there is no automatic retry or takeover. Inspect persisted tasks before proceeding. Score-only reevaluation is unavailable in this runtime. The public web adapter rejects private addresses but cannot establish publisher permission or content correctness.
 
 ### Repeatable synthetic product test
 
@@ -79,7 +159,7 @@ mise exec node@24.21.0 -- npm run test:e2e -- tests/e2e/enrichment.spec.ts
 mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/explicit-article-processing.test.ts tests/integration/article-processing-api.test.ts tests/integration/freshrss-product-chain.test.ts
 ```
 
-The browser test uses the real Fastify API and persistence, reloads saved category/tags/scores, and exercises score-only reevaluation including failure preservation. The import-chain test uses a locally intercepted FreshRSS protocol fixture and real import jobs, then invokes the explicit processing seam before starting fake-AI workers. Neither test proves automatic import-to-processing or provider behavior. The fixture ends with the test; it is not a persistent interactive demo. See [verification](docs/verification.md) for tested browser path and remaining gates.
+The browser test uses the real Fastify API and persistence, reloads saved category/tags/scores, and exercises score-only reevaluation including failure preservation. The import-chain test uses a locally intercepted FreshRSS protocol fixture and real import jobs, then invokes the explicit single-article HTTP endpoint with an injected processor before starting fake-AI workers. Neither test proves automatic import-to-processing or provider behavior. The fixture ends with the test; it is not a persistent interactive demo. See [verification](docs/verification.md) for tested browser path and remaining gates.
 
 ### Local checks and tests
 
@@ -93,6 +173,7 @@ mise exec node@24.21.0 -- npm run test:integration
 mise exec node@24.21.0 -- npm run test:e2e
 docker build -t feedrafter:local .
 bash tests/container/operations.sh feedrafter:local
+bash tests/container/local-compose.sh
 ```
 
 Unit and integration tests do not contact a live inference provider. Integration and real-server browser tests create their own disposable PostgreSQL 18 containers on loopback; they do not use the manual `DATABASE_URL`. Unit tests do not all require PostgreSQL. Playwright requires cached compatible Chromium: install it with `mise exec node@24.21.0 -- npm exec -- playwright install chromium`, or set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to an existing compatible browser. The container regression uses its own isolated Docker network and database, tests explicit migration, restart and database restore, then deletes them. Normal tests do not contact live providers.

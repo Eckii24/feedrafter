@@ -26,7 +26,9 @@ function validateTerminal(value: TerminalUsage): void {
 export class PostgresUsageAdmissionStore implements UsageAdmissionPort {
   private readonly owners = new WeakMap<UsageOwner, OwnerState>();
 
-  constructor(private readonly pool: pg.Pool, private readonly clock: Clock, private readonly recoveryPool: pg.Pool = pool) {}
+  constructor(private readonly pool: pg.Pool, private readonly clock: Clock, private readonly recoveryPool: pg.Pool = pool, private readonly caps?: Partial<Record<'automatic' | 'interactive' | 'classifier', { daily: number; concurrency: number }>>) {
+    for (const cap of Object.values(caps ?? {})) if (!Number.isSafeInteger(cap.daily) || cap.daily < 0 || !Number.isSafeInteger(cap.concurrency) || cap.concurrency < 0) throw new RangeError('Invalid usage caps');
+  }
 
   async recover(): Promise<number> {
     let transitioned = 0;
@@ -224,8 +226,11 @@ export class PostgresUsageAdmissionStore implements UsageAdmissionPort {
         "select count(*) as count from usage_ledger where bucket=$1 and status='reserved'", [intent.bucket],
       )).rows[0]!.count);
       check();
-      const reason = budget.daily_requests !== null && counter >= budget.daily_requests ? 'daily_limit'
-        : budget.concurrency !== null && active >= budget.concurrency ? 'concurrency_limit' : undefined;
+      const cap = this.caps?.[intent.bucket];
+      const daily = cap ? Math.min(budget.daily_requests ?? cap.daily, cap.daily) : budget.daily_requests;
+      const concurrency = cap ? Math.min(budget.concurrency ?? cap.concurrency, cap.concurrency) : budget.concurrency;
+      const reason = daily !== null && counter >= daily ? 'daily_limit'
+        : concurrency !== null && active >= concurrency ? 'concurrency_limit' : undefined;
       if (reason) {
         await session.client.query('rollback');
         transaction = false;

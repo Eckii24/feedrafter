@@ -9,6 +9,17 @@ describe('configuration', () => {
     expect(loadConfig(base).fresh).toBeUndefined();
     for (const env of [{ PORT: '' }, { PORT: '0' }, { APP_ORIGIN: 'http://user:secret@localhost/' }, { TRUSTED_PROXIES: '1.2.3.4/33' }, { FRESHRSS_ENABLED: 'true' }, { FRESHRSS_ENABLED: 'yes' }]) expect(() => loadConfig({ ...base, ...env })).toThrow();
   });
+  it('requires every local processing acknowledgement and explicit nonnegative caps', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'feedrafter-local-'));
+    try {
+      const path = join(dir, 'key'); writeFileSync(path, 'synthetic-key\n', { mode: 0o600 });
+      const env = { ...base, LOCAL_PROCESSING_ENABLED: 'true', LOCAL_EXCLUSIVE_DB_ACK: 'true', LOCAL_UNVERIFIED_SIZING_ACK: 'true', LOCAL_CODEX_COST_ACK: 'true', LOCAL_CLASSIFIER_DAILY: '10', LOCAL_CLASSIFIER_CONCURRENCY: '1', LOCAL_AUTOMATIC_DAILY: '5', LOCAL_AUTOMATIC_CONCURRENCY: '1', TYPESAFE_API_KEY_FILE: path };
+      expect(loadConfig(base).localProcessing).toBeUndefined();
+      expect(loadConfig(env).localProcessing).toEqual({ classifierDaily: 10, classifierConcurrency: 1, automaticDaily: 5, automaticConcurrency: 1, typesafeKey: 'synthetic-key' });
+      for (const key of ['LOCAL_EXCLUSIVE_DB_ACK', 'LOCAL_UNVERIFIED_SIZING_ACK', 'LOCAL_CODEX_COST_ACK', 'LOCAL_CLASSIFIER_DAILY', 'LOCAL_CLASSIFIER_CONCURRENCY', 'LOCAL_AUTOMATIC_DAILY', 'LOCAL_AUTOMATIC_CONCURRENCY', 'TYPESAFE_API_KEY_FILE'] as const) expect(() => loadConfig({ ...env, [key]: '' })).toThrow();
+      expect(() => loadConfig({ ...env, LOCAL_CLASSIFIER_DAILY: '-1' })).toThrow();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
   it('validates optional Karakeep authority and exclusive secret sources', () => {
     const dir = mkdtempSync(join(tmpdir(), 'feedrafter-karakeep-'));
     try {

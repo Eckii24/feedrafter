@@ -9,10 +9,11 @@ it('retains only typed auth evidence through Pi-style error conversion for both 
   const c = { id: 'jev-latest', provider: 'typesafe', type: 'classifier', api: 'typesafe-system-one', baseUrl: 'https://api.typesafe.ai/v1', input: ['text'] };
   const g = { id: 'gpt-4.1-mini', provider: 'openai', api: 'openai-responses', baseUrl: 'https://api.openai.com/v1', input: ['text'] };
   const runtime = {
+    credentials: { store: { read: vi.fn(), modify: vi.fn() } },
     getAuth, getError: () => undefined, listCredentials: async () => [], getProviderAuthStatus: () => ({ configured: true }),
     getModelOfType: () => c, getPhysicalModel: () => g,
-    async classify() { try { await runtime.getAuth(); } catch { return { stopReason: 'error', errorMessage: 'flattened secret' }; } },
-    stream() { return { async result() { try { await runtime.getAuth(); } catch { return { stopReason: 'error', errorMessage: 'flattened secret', content: [] }; } } }; },
+    async classify() { try { await runtime.getAuth('typesafe'); } catch { return { stopReason: 'error', errorMessage: 'flattened secret' }; } },
+    stream() { return { async result() { try { await runtime.getAuth('openai'); } catch { return { stopReason: 'error', errorMessage: 'flattened secret', content: [] }; } } }; },
   };
   const create = vi.spyOn(ModelRuntime, 'create').mockResolvedValue(runtime as unknown as ModelRuntime);
   let observed: unknown;

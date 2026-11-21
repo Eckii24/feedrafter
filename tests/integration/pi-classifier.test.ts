@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -120,6 +120,17 @@ describe('real Pi classifier and committed usage admission', () => {
     const result = await attempt;
     expect(result).toMatchObject({ kind: 'completed', value: { answers: { b: { type: 'bool', probability: 0.75 }, c: { choice: 'a' }, s: { score: 0.5, criteria: ['low', 'mid', 'high'] } }, usage: { inputTokens: 5, outputTokens: null, costUsd: null } } });
     expect(await ledger()).toMatchObject([{ status: 'succeeded', input_tokens: 5, output_tokens: null, tokens_source: 'provider', cost_usd: null, cost_source: 'unknown' }]);
+  });
+  it('sends the configured TypeSafe key even when copied Pi auth conflicts', async () => {
+    const authPath = join(dir, 'auth.json');
+    await writeFile(authPath, JSON.stringify({ typesafe: { type: 'api_key', key: 'conflicting-fixture-key' } }));
+    try {
+      const attempt = classifier.classify(request, scope());
+      const received = await next(attempt);
+      expect(received.request.headers.authorization).toBe('Bearer fixture-only-key');
+      received.respond(200, { 'content-type': 'application/json' }, JSON.stringify(body));
+      expect(await attempt).toMatchObject({ kind: 'completed' });
+    } finally { await writeFile(authPath, '{}'); }
   });
   it('routes the quality seam through Pi and records its preparation task', async () => {
     // Fixture-only sizing; not evidence of a provider tokenizer or framing.

@@ -22,6 +22,19 @@ describe('article quality classifier seam', () => {
     expect(count).toHaveBeenCalledWith(JSON.stringify(request));
     expect(receivedScope).toEqual({ bucket: 'classifier', taskId: 'task', signal });
   });
+  it('bounds the exact local quality request by UTF-8 bytes before dispatch', async () => {
+    const classify = vi.fn<AiPort['classify']>().mockResolvedValue({ kind: 'completed', value: { answers: { usable: { type: 'bool', probability: 1 } }, usage: null } });
+    const local = { kind: 'unverified' as const, model: verified().model, limits: { contextTokens: 2000, outputTokens: 10, framingTokens: 5, maxRequestBytes: 1000 } };
+    const content = { ...input, text: 'café 😀' };
+    await createArticleQualityClassifier({ classify }, local).classify(content, scope(), 'task');
+    const size = Buffer.byteLength(JSON.stringify(classify.mock.calls[0]![0]));
+    classify.mockClear();
+    await createArticleQualityClassifier({ classify }, { ...local, limits: { ...local.limits, maxRequestBytes: size, contextTokens: size + 15 } }).classify(content, scope(), 'task');
+    expect(classify).toHaveBeenCalledOnce();
+    classify.mockClear();
+    await expect(createArticleQualityClassifier({ classify }, { ...local, limits: { ...local.limits, maxRequestBytes: size - 1 } }).classify(content, scope(), 'task')).rejects.toThrow('exceeds');
+    expect(classify).not.toHaveBeenCalled();
+  });
   it('rejects oversized requests, cancellation and invalid identity before dispatch', async () => {
     const classify = vi.fn<AiPort['classify']>();
     const classifier = createArticleQualityClassifier({ classify }, { ...verified(), countTokens: () => 1000 });

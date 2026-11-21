@@ -2,6 +2,45 @@
 
 **D1 is not accepted.** This record is evidence, not implementation approval. Criteria are defined in [the specification](dev-agentic-news-reader-spec.md); V1–V9 are defined in `.ai/news-reader-plan.md`. Baseline AC14/AC21 means only the D1 reader/operations subset, not later score, Pi or enrichment requirements. Results below are for this local run, not the deployed system.
 
+## Local opt-in runtime (synthetic verification)
+
+The local opt-in wires the real startup path, public web/quality seam and category/tag/score workers behind explicit acknowledgement, a point-in-time empty-queue preflight and the operator-enforced exclusive dedicated database prerequisite. Normal startup registers no inference workers. Request sizing and Codex output/cost remain unverified; this is not protection from concurrent producers or production acceptance. See [local processing](../README.md#local-processing-opt-in).
+
+On Node 24.21.0: `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/unit/config.test.ts tests/integration/local-runtime.test.ts tests/integration/local-queue-preflight.test.ts tests/integration/article-processing-api.test.ts tests/integration/freshrss-product-chain.test.ts tests/integration/usage-reservations.test.ts` passed 6 files / 21 tests. The new runtime test uses fake AI and public web with a disposable PostgreSQL 18 database and real PgBoss/usage admission; it checks disabled startup, selected/unselected work, daily/concurrent caps and pending-queue refusal. `npm run test:unit` passed 39 files / 707 tests; typecheck, lint and build passed. `bash tests/container/local-compose.sh` passed disabled and synthetic-credential opt-in startup, migration, persistence and HTTP health. No inference request is made by the container test. No real provider, real secret, full integration suite, browser E2E or user acceptance was exercised for this change.
+
+Sections below describe earlier checkpoints and can refer to capabilities as dormant before this opt-in was added.
+
+## Explicit single-article HTTP checkpoint (not live activation)
+
+Normal serving returns 503 for `POST /api/v1/articles/:id/processing`. A synthetic-only injected processor handles one selected UUID over real loopback HTTP; it imports a FreshRSS fixture, prepares that article and queues category → tags → scores in PostgreSQL/PgBoss. Duplicate selection, invalid body, cross-origin rejection, missing IDs, and disabled serving are covered. Existing workers still consume shared queues, and failure or interruption can leave partial work. This is not a live activation or a user-accepted finished product.
+
+On Node 24.21.0, with fake AI and no live providers:
+
+- `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/freshrss-product-chain.test.ts tests/integration/article-processing-api.test.ts tests/integration/pi-codex.test.ts --maxWorkers=1`: **3 files / 17 tests passed**. Includes disposable PostgreSQL, real HTTP and PgBoss, and fake Codex OAuth with loopback TLS.
+- `mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/explicit-article-processing.test.ts tests/api/security.test.ts --maxWorkers=1`: **2 files / 7 tests passed**.
+- `mise exec node@24.21.0 -- npm run typecheck`, `npm run lint`, `npm run build`: passed.
+- `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$HOME/.cache/ms-playwright/chromium_headless_shell-1243/chrome-headless-shell-linux64/chrome-headless-shell" mise exec node@24.21.0 -- npm run test:e2e -- tests/e2e/enrichment.spec.ts`: **1 passed**.
+- `bash tests/container/local-compose.sh`: passed actual isolated Compose build, migration, HTTP health, shutdown/restart and database/data-volume persistence; no credentials or real providers.
+
+Activation remains blocked by missing model-specific verified input sizing and framing for `typesafe/jev-latest` and `openai-codex/gpt-6-luna`, plus a safe policy accounting for Codex output not being capped by Pi. The existing input counter only supports `openai/gpt-4.1-mini`; the HTTP and classifier fixtures do not establish real model sizing. OAuth refresh needs writable protected auth storage; provider subscription cost remains unknown.
+
+## Dormant Codex OAuth direct adapter
+
+`createPiCodexGenerator` is an unwired direct capability restricted to the pinned built-in `openai-codex/gpt-6-luna`, Pi's `openai-codex-responses` API and `https://chatgpt.com/backend-api/codex/responses`. The existing private runtime owns OAuth resolution and refresh; auth traffic uses no inference permit or separate ledger credit. A refresh can occur after the inference reservation and persist rotated private credentials. The inference POST uses the existing single-send transport and admission gate. No normal composition, session or provider activation was added. Output tokens are not hard-capped by this adapter; catalog-derived cost is not trusted and cost remains unknown.
+
+On Node 24.21.0, disposable PostgreSQL 18 and local TLS interception, with fake OAuth responses and no real provider network:
+
+- `mise exec node@24.21.0 -- npm exec -- vitest run tests/integration/pi-codex.test.ts tests/integration/pi-generator.test.ts tests/unit/pi-runtime.test.ts`: **3 files / 62 tests passed**. Codex cases prove Pi refresh and rotation, an already committed inference reservation, one TLS inference send, successful SSE including `response.done`, unknown cost, no `max_output_tokens`, denial, truncated stream, unsupported model, 421/redirect/429/500 without replay, and sanitized refresh failure with subsequent auth pause. Refresh traffic is separately faked and does not create an additional ledger row.
+- `mise exec node@24.21.0 -- npm run test:unit`: **38 files / 693 tests passed**.
+- `mise exec node@24.21.0 -- npm run typecheck`, `npm run lint`, and `npm run build`: passed. Typecheck and lint reran after the final test-only assertion changes.
+- `mise exec node@24.21.0 -- npm run test:integration`: **timed out after 300 seconds**, exit 124, with only the Vitest start banner and no suite summary. An earlier Node 26.13.0 run also timed out after 360 seconds; its output was not captured. Disposable article-worker containers left by the interrupted runs were removed. The full integration suite is not verified.
+
+### Codex reasoning-block regression
+
+On Node 24.21.0 with disposable PostgreSQL and intercepted loopback TLS, fake OAuth only and no real provider network: before the fix, `mise exec node@24.21.0 -- npm exec -- vitest run tests/integration/pi-codex.test.ts` produced **1 failure / 10 passes**: the real Pi reasoning-plus-text stream settled uncertain. After the fix, `mise exec node@24.21.0 -- npm exec -- vitest run tests/integration/pi-codex.test.ts tests/integration/pi-generator.test.ts tests/unit/pi-runtime.test.ts` passed **3 files / 69 tests**. The Codex test exercises reasoning summary and encrypted metadata followed by text, exact text-only result, one inference send, and provider token usage. Tool calls and malformed reasoning events remain uncertain; injected malformed/unexpected Pi blocks also remain uncertain. The OpenAI fixture still rejects a real Pi thinking block. `mise exec node@24.21.0 -- npm run typecheck` and `mise exec node@24.21.0 -- npm run lint` passed after the final test change.
+
+No live OAuth, actual provider inference, deployed-container proof, formal review or inherited C11/V11/V15 acceptance is claimed. Focused fixture evidence does not establish a provider output/cost cap or real account entitlement. Next: diagnose the full-suite hang separately and run the authorized live gates only when separately approved.
+
 ## P2 — local real-server product exercise
 
 P2 source and tests are implemented, uncommitted. `src/server/http/app.ts` exposes sanitized action-discriminated category/tag task status and includes those actions in advisory task-change polling. `tests/helpers/article-processing-fixture.ts` owns a uniquely named disposable PostgreSQL 18 container, migrations, real PgBoss, fake AI, real in-memory-HTML preparation and test-only `ArticleJobs` admission. It does not accept a DB URL or add a fake-AI runtime switch. `tests/integration/article-processing-api.test.ts` exercises real loopback HTTP status, waiting/paused/failed states, unsupported IDs/actions, sanitized fields and post-update SSE invalidations. Existing `karakeep.test.ts` and `score-worker.test.ts` preserve the other task DTOs.

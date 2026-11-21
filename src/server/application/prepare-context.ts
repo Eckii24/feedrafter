@@ -14,6 +14,8 @@ export type ContextInput = Readonly<{
   tools: string;
   limits: Readonly<{ contextTokens: number; outputTokens: number; framingTokens: number; maxInputTokens?: number }>;
   tokenizer?: (serializedRequest: string) => number;
+  // A callback may measure a reconstructed request in UTF-8 bytes instead of tokens.
+  sizing?: 'provider' | 'utf8-bytes';
   // Evidence execution needs a persisted chunk even if the generator fits all content.
   forceChunks?: boolean;
   scoreTargetId?: string;
@@ -47,7 +49,7 @@ export function prepareContext(input: ContextInput): ContextPlan {
   if (!input || !input.article || !input.fields || !input.limits || typeof input.taskKind !== 'string' || !input.taskKind.trim() || typeof input.article.id !== 'string' || !input.article.id.trim() || !integer(input.article.contentRevision, 0) || !integer(input.generation, 0)) throw new RangeError('invalid context identity');
   const { article, fields, limits } = input;
   if (['includeTitle', 'includeContent', 'includeCategory', 'includeTagWeights', 'includeSourceWeight'].some(key => typeof fields[key as keyof ContextFields] !== 'boolean')) throw new RangeError('invalid context fields');
-  if (typeof input.prompt !== 'string' || !Array.isArray(input.questions) || input.questions.some(q => typeof q !== 'string') || typeof input.tools !== 'string' || (input.tokenizer !== undefined && typeof input.tokenizer !== 'function')) throw new RangeError('invalid request');
+  if (typeof input.prompt !== 'string' || !Array.isArray(input.questions) || input.questions.some(q => typeof q !== 'string') || typeof input.tools !== 'string' || (input.tokenizer !== undefined && typeof input.tokenizer !== 'function') || (input.sizing !== undefined && input.sizing !== 'provider' && input.sizing !== 'utf8-bytes') || (input.sizing === 'provider' && !input.tokenizer)) throw new RangeError('invalid request');
   if (!integer(limits.contextTokens, 1) || !integer(limits.outputTokens, 0) || !integer(limits.framingTokens, 0) || (limits.maxInputTokens !== undefined && !integer(limits.maxInputTokens, 1)) || limits.outputTokens + limits.framingTokens > limits.contextTokens) throw new RangeError('invalid token limits');
   if (typeof article.content !== 'string' || (article.title !== null && typeof article.title !== 'string') || (article.category !== null && typeof article.category !== 'string') || (article.sourceWeight !== null && !Number.isFinite(article.sourceWeight)) || !Array.isArray(article.tagWeights) || article.tagWeights.some(t => !t || typeof t.tag !== 'string' || !Number.isFinite(t.weight))) throw new RangeError('invalid article');
   const times = article.timeBoundaries ?? [];
@@ -65,7 +67,7 @@ export function prepareContext(input: ContextInput): ContextPlan {
     return { request, serialized, inputTokens, totalTokens };
   };
   const fits = (s: SizedRequest) => s.totalTokens <= limits.contextTokens && (limits.maxInputTokens === undefined || s.inputTokens + limits.framingTokens <= limits.maxInputTokens);
-  const basis = { articleId: article.id, contentRevision: article.contentRevision, generation: input.generation, taskKind: input.taskKind, sizing: input.tokenizer ? 'provider' as const : 'utf8-bytes' as const, offsetUnit: 'utf16' as const, condensed: false as const, limited: false as const };
+  const basis = { articleId: article.id, contentRevision: article.contentRevision, generation: input.generation, taskKind: input.taskKind, sizing: input.sizing ?? (input.tokenizer ? 'provider' as const : 'utf8-bytes' as const), offsetUnit: 'utf16' as const, condensed: false as const, limited: false as const };
   const length = fields.includeContent ? article.content.length : 0;
   // The empty selected-content envelope includes every fixed field and both reserves.
   const fixed = size(fields.includeContent ? '' : undefined);

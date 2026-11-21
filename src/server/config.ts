@@ -1,9 +1,9 @@
 import { isIP } from 'node:net';
-import { readFileSync, statSync } from 'node:fs';
+import { lstatSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { KarakeepClient } from './adapters/karakeep/client.js';
 
-export interface AppConfig { databaseUrl: string; origin: string; host: string; port: number; trustedProxies: string[]; fresh?: { baseUrl: string; email: string; password: string }; karakeep?: { baseUrl: string; token: string } }
+export interface AppConfig { databaseUrl: string; origin: string; host: string; port: number; trustedProxies: string[]; fresh?: { baseUrl: string; email: string; password: string }; karakeep?: { baseUrl: string; token: string }; localProcessing?: { classifierDaily: number; classifierConcurrency: number; automaticDaily: number; automaticConcurrency: number; typesafeKey: string } }
 function value(env: NodeJS.ProcessEnv, name: string, fallback?: string): string {
   const v = env[name] ?? fallback;
   if (v === undefined || !v.trim() || v !== v.trim()) throw new Error(`Invalid ${name}`);
@@ -53,5 +53,18 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
     karakeep = { baseUrl: value(env, 'KARAKEEP_BASE_URL'), token };
     new KarakeepClient(karakeep); // Validate exactly the authority and bearer syntax used by the client.
   }
-  return { databaseUrl, origin: originUrl.origin, host, port: Number(portText), trustedProxies, ...(fresh ? { fresh } : {}), ...(karakeep ? { karakeep } : {}) };
+  let localProcessing: AppConfig['localProcessing'];
+  if (env.LOCAL_PROCESSING_ENABLED !== undefined && !['true', 'false'].includes(env.LOCAL_PROCESSING_ENABLED)) throw new Error('Invalid LOCAL_PROCESSING_ENABLED');
+  if (env.LOCAL_PROCESSING_ENABLED === 'true') {
+    for (const name of ['LOCAL_EXCLUSIVE_DB_ACK', 'LOCAL_UNVERIFIED_SIZING_ACK', 'LOCAL_CODEX_COST_ACK']) if (env[name] !== 'true') throw new Error(`Required acknowledgement: ${name}`);
+    const cap = (name: string) => { const v = value(env, name); if (!/^\d+$/.test(v) || !Number.isSafeInteger(Number(v)) || Number(v) > 2147483647) throw new Error(`Invalid ${name}`); return Number(v); };
+    const path = value(env, 'TYPESAFE_API_KEY_FILE');
+    if (!isAbsolute(path)) throw new Error('Invalid TypeSafe secret file');
+    const secretStat = lstatSync(path);
+    if (!secretStat.isFile() || secretStat.size > 16384 || (secretStat.mode & 0o077) !== 0 || secretStat.uid !== process.getuid?.()) throw new Error('Invalid TypeSafe secret file');
+    const typesafeKey = readFileSync(path, 'utf8').replace(/\r?\n$/, '');
+    if (!/^[\x21-\x7e]+$/.test(typesafeKey)) throw new Error('Invalid TypeSafe secret file');
+    localProcessing = { classifierDaily: cap('LOCAL_CLASSIFIER_DAILY'), classifierConcurrency: cap('LOCAL_CLASSIFIER_CONCURRENCY'), automaticDaily: cap('LOCAL_AUTOMATIC_DAILY'), automaticConcurrency: cap('LOCAL_AUTOMATIC_CONCURRENCY'), typesafeKey };
+  }
+  return { databaseUrl, origin: originUrl.origin, host, port: Number(portText), trustedProxies, ...(fresh ? { fresh } : {}), ...(karakeep ? { karakeep } : {}), ...(localProcessing ? { localProcessing } : {}) };
 }

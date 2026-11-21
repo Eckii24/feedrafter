@@ -20,7 +20,9 @@ describe('shared Pi runtime boundary', () => {
   it('constructs one private runtime and exports only admitted capabilities', async () => {
     const classifierModel = { id: 'jev-latest', provider: 'typesafe', type: 'classifier', api: 'typesafe-system-one', baseUrl: 'https://api.typesafe.ai/v1', input: ['text'] };
     const chatModel = { id: 'gpt-4.1-mini', provider: 'openai', api: 'openai-responses', baseUrl: 'https://api.openai.com/v1', input: ['text'] };
-    const runtime = { getAuth: vi.fn(), getError: vi.fn(), listCredentials: vi.fn(async () => []), getProviderAuthStatus: vi.fn(() => ({ configured: false })), getModelOfType: vi.fn(() => classifierModel), getPhysicalModel: vi.fn(() => chatModel) } as unknown as ModelRuntime;
+    const originalRead = vi.fn<(provider: string) => Promise<undefined>>().mockResolvedValue(undefined);
+    const store = { read: originalRead, modify: vi.fn(async () => ({ type: 'api_key', key: '!fixture-command' })) };
+    const runtime = { credentials: { store }, getAuth: vi.fn(), getError: vi.fn(), listCredentials: vi.fn(async () => []), getProviderAuthStatus: vi.fn(() => ({ configured: false })), getModelOfType: vi.fn(() => classifierModel), getPhysicalModel: vi.fn(() => chatModel) } as unknown as ModelRuntime;
     const getAuth = runtime.getAuth;
     const create = vi.spyOn(ModelRuntime, 'create').mockResolvedValue(runtime);
     const usage = { executeAttempt: vi.fn(async () => ({ kind: 'paused_budget', reason: 'daily_limit' })) } as unknown as UsageService;
@@ -30,6 +32,9 @@ describe('shared Pi runtime boundary', () => {
     expect(Object.keys(generator)).toEqual(['generate']);
     expect(create).toHaveBeenCalledOnce();
     expect(create).toHaveBeenCalledWith({ authPath: '/data/pi-auth/auth.json', modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
+    await expect(store.read('openai')).rejects.toThrow('Command credentials are disabled');
+    expect(originalRead).not.toHaveBeenCalled();
+    expect(store.modify).toHaveBeenCalledOnce();
     const boundary = await import('../../src/server/adapters/pi/runtime.js');
     expect(boundary).not.toHaveProperty('createPiRuntime');
     expect(boundary).not.toHaveProperty('selectPhysicalModel');

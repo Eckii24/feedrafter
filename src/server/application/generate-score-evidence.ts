@@ -4,6 +4,7 @@ import { isPostgresJsonText } from '../domain/postgres-json-text.js';
 import { prepareContext, type ContextChunk, type ContextInput } from './prepare-context.js';
 import type { ScoreContextTask } from './process-context-chunks.js';
 import { UsageAttemptError } from './usage.js';
+import { measureRequest, requestPlannerLimits } from './score-context-request.js';
 
 const system = 'Extract evidence for the score question from the selected context. Return only JSON: {"items":[{"questionIndex":0,"polarity":"support|counter|uncertain","text":"compact evidence","quotes":["verbatim source quote"]}]}. Use only verbatim quotes from context.content. Return an empty items array if none. Do not report coverage or a score.';
 type Store = Pick<ContextStore, 'save' | 'resume' | 'claimRepair'>;
@@ -35,9 +36,9 @@ export async function generateScoreEvidence(task: ScoreContextTask, ai: AiPort, 
   const requestFor = (context: JsonObject): GenerationRequest => ({ model: task.generator.model, role: 'context_reduction', system, user: JSON.stringify({ question: task.prompt, context }) });
   const tokenizer = (serialized: string) => {
     const envelope = JSON.parse(serialized) as { context: JsonObject };
-    return task.generator.countTokens(JSON.stringify(requestFor(envelope.context)));
+    return measureRequest(task.generator, requestFor(envelope.context)).inputTokens;
   };
-  const input: ContextInput = { taskKind: 'scores', scoreTargetId: task.scoreId, fields: task.fields, article: task.article, generation: task.generation, prompt: task.prompt, questions: [task.prompt], tools: JSON.stringify({ model: task.generator.model, system, scoreId: task.scoreId }), limits: task.generator.limits, tokenizer, forceChunks: true };
+  const input: ContextInput = { taskKind: 'scores', scoreTargetId: task.scoreId, fields: task.fields, article: task.article, generation: task.generation, prompt: task.prompt, questions: [task.prompt], tools: JSON.stringify({ model: task.generator.model, system, scoreId: task.scoreId }), limits: requestPlannerLimits(task.generator), tokenizer, sizing: 'kind' in task.generator ? 'utf8-bytes' : 'provider', forceChunks: true };
   const plan = prepareContext(input);
   if (plan.kind !== 'chunks') throw new Error('expected evidence chunks');
   let saved = await store.resume(task.owner, input);
@@ -47,9 +48,8 @@ export async function generateScoreEvidence(task: ScoreContextTask, ai: AiPort, 
     if (saved.state.completedChunkIds.includes(chunk.id)) continue;
     if (saved.state.repairStartedChunkIds.includes(chunk.id)) throw new Error('repair opportunity already consumed for incomplete chunk');
     const request = requestFor(chunk.request.context as JsonObject);
-    const size = task.generator.countTokens(JSON.stringify(request));
-    const { contextTokens, outputTokens, framingTokens, maxInputTokens } = task.generator.limits;
-    if (!Number.isSafeInteger(size) || size < 0 || size !== chunk.inputTokens || !Number.isSafeInteger(size + outputTokens + framingTokens) || size + outputTokens + framingTokens > contextTokens || (maxInputTokens !== undefined && size + framingTokens > maxInputTokens)) throw new RangeError('generator request exceeds verified limits');
+    const measured = measureRequest(task.generator, request);
+    if (measured.inputTokens !== chunk.inputTokens || !measured.fits) throw new RangeError(`generator request exceeds ${'kind' in task.generator ? 'unverified local' : 'verified'} limits`);
     let outcome;
     try { outcome = await ai.generate(request, { bucket: 'automatic', taskId: task.owner.taskId, signal: task.signal }); }
     catch (error) { if (error instanceof UsageAttemptError && error.kind === 'auth') return { kind: 'paused_auth' as const, progress: saved.state }; throw error; }
@@ -59,8 +59,7 @@ export async function generateScoreEvidence(task: ScoreContextTask, ai: AiPort, 
     catch (error) {
       if (!(error instanceof RangeError)) throw error;
       const repair: GenerationRequest = { ...request, system: system.replace('Extract evidence', 'Repair evidence') };
-      const repairSize = task.generator.countTokens(JSON.stringify(repair));
-      if (!Number.isSafeInteger(repairSize) || repairSize < 0 || !Number.isSafeInteger(repairSize + outputTokens + framingTokens) || repairSize + outputTokens + framingTokens > contextTokens || (maxInputTokens !== undefined && repairSize + framingTokens > maxInputTokens)) throw new RangeError('repair request exceeds verified limits', { cause: error });
+      if (!measureRequest(task.generator, repair).fits) throw new RangeError(`repair request exceeds ${'kind' in task.generator ? 'unverified local' : 'verified'} limits`, { cause: error });
       const claimed = await store.claimRepair(task.owner, input, chunk.id, new Date());
       if (!claimed) throw new Error('repair opportunity already consumed or stale context task', { cause: error });
       saved = claimed;

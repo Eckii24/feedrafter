@@ -22,9 +22,10 @@ import type { Database } from '../adapters/postgres/client.js';
 import type { ImportJobs } from '../adapters/postgres/import-jobs.js';
 import type { KarakeepJobs } from '../adapters/postgres/karakeep-jobs.js';
 import type { ScoreAdmission } from '../adapters/postgres/score-admission.js';
+import type { processExplicitArticles } from '../adapters/postgres/explicit-article-processing.js';
 import type pg from 'pg';
 
-export interface HttpDependencies { db: Database; pool: pg.Pool; origin: string; trustedProxies: string[]; imports?: { jobs: ImportJobs; contextId: string }; karakeep?: KarakeepJobs; scoreAdmission?: ScoreAdmission }
+export interface HttpDependencies { db: Database; pool: pg.Pool; origin: string; trustedProxies: string[]; imports?: { jobs: ImportJobs; contextId: string }; karakeep?: KarakeepJobs; scoreAdmission?: ScoreAdmission; processArticles?: (ids: readonly string[]) => ReturnType<typeof processExplicitArticles> }
 const uuid = { type: 'string', format: 'uuid' } as const;
 const idParams = { type: 'object', additionalProperties: false, required: ['id'], properties: { id: uuid } } as const;
 const errorSchema = { type: 'object', required: ['error'], properties: { error: { type: 'object', required: ['code', 'message', 'requestId'], properties: { code: { type: 'string' }, message: { type: 'string' }, requestId: { type: 'string' } } } } } as const;
@@ -224,6 +225,16 @@ export async function buildHttpApp(deps: HttpDependencies) {
   app.get<{ Params: { id: string } }>('/api/v1/articles/:id', { schema: { params: idParams, response: { 200: articleSchema, ...commonResponses } } }, async (request, reply) => { const row = await reader.getArticle(request.params.id); return row ? articleDto(row) : reply.code(404).send(notFound(request.id)); });
   app.get<{ Params: { id: string } }>('/api/v1/articles/:id/scores', { schema: { params: idParams, response: { 200: { type: 'object', additionalProperties: false, required: ['items'], properties: { items: { type: 'array', items: scoreResultItem } } }, ...commonResponses } } }, async (request, reply) => (await new ScoreReaderStore(deps.pool).getForReader(request.params.id)) ?? reply.code(404).send(notFound(request.id)));
   app.get<{ Params: { id: string } }>('/api/v1/articles/:id/summary', { schema: { params: idParams, response: { 200: summarySchema, ...commonResponses } } }, async (request, reply) => (await summaries.getForReader(request.params.id)) ?? reply.code(404).send(notFound(request.id)));
+  // Explicit single-article opt-in. Normal composition intentionally leaves this unavailable.
+  app.post<{ Params: { id: string } }>('/api/v1/articles/:id/processing', { schema: { params: idParams, body: { type: 'object', additionalProperties: false, maxProperties: 0 }, response: { 200: { type: 'object', required: ['kind'], properties: { kind: { type: 'string' }, prepareTaskId: uuid, categoryTaskId: uuid, tagsTaskId: uuid, scoreTaskIds: { type: 'array', items: uuid } } }, ...commonResponses } } }, async (request, reply) => {
+    if (!deps.processArticles) return reply.code(503).send({ error: { code: 'PROCESSING_UNAVAILABLE', message: 'Article processing unavailable', requestId: request.id } });
+    const [result] = await deps.processArticles([request.params.id]);
+    if (!result) throw new Error('Missing processing result');
+    if (result.kind === 'admission') return result.admission.kind === 'admitted'
+      ? { kind: 'admitted', prepareTaskId: result.prepareTaskId, categoryTaskId: result.admission.categoryTaskId, tagsTaskId: result.admission.tagsTaskId, scoreTaskIds: result.admission.scoreTaskIds }
+      : { kind: result.admission.kind, prepareTaskId: result.prepareTaskId };
+    return 'prepareTaskId' in result ? { kind: result.kind, prepareTaskId: result.prepareTaskId } : { kind: result.kind };
+  });
   app.post<{ Params: { id: string } }>('/api/v1/articles/:id/reevaluations', { schema: { params: idParams, body: { type: 'object', additionalProperties: false, maxProperties: 0 }, response: { 202: { type: 'object', required: ['tasks'], properties: { tasks: { type: 'array', items: { type: 'object', required: ['taskId', 'scoreTargetId', 'generation', 'state'], properties: { taskId: uuid, scoreTargetId: uuid, generation: { type: 'integer' }, state: { type: 'string' } } } } } }, ...commonResponses } } }, async (request, reply) => {
     if (!deps.scoreAdmission) return reply.code(503).send({ error: { code: 'SCORE_UNAVAILABLE', message: 'Score admission unavailable', requestId: request.id } });
     const result = await deps.scoreAdmission.admit(request.params.id);

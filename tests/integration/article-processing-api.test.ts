@@ -2,11 +2,18 @@ import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { expect, it } from 'vitest';
 import { articleProcessingFixture } from '../helpers/article-processing-fixture.js';
+import { buildHttpApp } from '../../src/server/http/app.js';
 
 it('exposes sanitized category and tag progress over real HTTP and emits task changes', async () => {
   const f = await articleProcessingFixture();
   const controller = new AbortController();
   try {
+    const disabled = await buildHttpApp({ ...f.database, origin: f.origin, trustedProxies: [] });
+    try {
+      const response = await disabled.inject({ method: 'POST', url: `/api/v1/articles/${f.article}/processing`, headers: { host: new URL(f.origin).host, 'content-type': 'application/json' }, payload: '{}' });
+      expect(response.statusCode).toBe(503);
+      expect(response.json().error.code).toBe('PROCESSING_UNAVAILABLE');
+    } finally { await disabled.close(); }
     const get = (id: string) => fetch(`${f.origin}/api/v1/processing-tasks/${id}`);
     const category = await get(f.admitted.categoryTaskId);
     expect(category.status).toBe(200);

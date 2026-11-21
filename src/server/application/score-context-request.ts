@@ -29,6 +29,49 @@ export function measureVerifiedRequest(model: VerifiedModel, request: object): {
   return { serialized, inputTokens, fits: total <= contextTokens && (maxInputTokens === undefined || framed <= maxInputTokens) };
 }
 
+/** Opt-in for a local runtime; does not enforce network isolation. maxRequestBytes
+ * bounds UTF-8 JSON.stringify(request), not transport bytes. The caller supplies
+ * context and positive output/framing reserves. One token per byte is only an
+ * assumption, not verified tokenization or a guarantee against context overflow. */
+export type UnverifiedLocalModel = Readonly<{
+  kind: 'unverified';
+  model: ModelReference;
+  limits: Readonly<{ contextTokens: number; outputTokens: number; framingTokens: number; maxRequestBytes: number }>;
+}>;
+export type RequestModel = VerifiedModel | UnverifiedLocalModel;
+
+export function validateRequestModel(model: RequestModel): void {
+  if (!model || typeof model !== 'object') throw new RangeError('invalid request model limits');
+  if ('kind' in model) {
+    const limits = model.limits;
+    const positive = (n: number) => Number.isSafeInteger(n) && n > 0;
+    if (model.kind !== 'unverified' || !model.model?.provider?.trim() || !model.model.model?.trim() || !limits || !positive(limits.contextTokens) || !positive(limits.outputTokens) || !positive(limits.framingTokens) || !positive(limits.maxRequestBytes) || !Number.isSafeInteger(limits.outputTokens + limits.framingTokens) || limits.outputTokens + limits.framingTokens > limits.contextTokens || !Number.isSafeInteger(limits.maxRequestBytes + limits.framingTokens)) throw new RangeError('invalid unverified local model limits');
+  } else validateVerifiedModel(model);
+}
+
+export function copyRequestModel(model: RequestModel): RequestModel {
+  if (model && 'kind' in model) return { ...model, model: { ...model.model }, limits: { ...model.limits } };
+  return { ...model, model: { ...model?.model }, limits: { ...model?.limits } };
+}
+
+/** Planner uses bytes as a conservative estimate, never as verified token counts. */
+export function requestPlannerLimits(model: RequestModel): ContextInput['limits'] {
+  validateRequestModel(model);
+  if ('kind' in model) return { contextTokens: model.limits.contextTokens, outputTokens: model.limits.outputTokens, framingTokens: model.limits.framingTokens, maxInputTokens: model.limits.maxRequestBytes + model.limits.framingTokens };
+  return model.limits;
+}
+
+export function measureRequest(model: RequestModel, request: object): { serialized: string; inputTokens: number; fits: boolean } {
+  validateRequestModel(model);
+  if (!('kind' in model)) return measureVerifiedRequest(model, request);
+  const serialized = JSON.stringify(request);
+  const inputTokens = Buffer.byteLength(serialized, 'utf8');
+  const { contextTokens, outputTokens, framingTokens, maxRequestBytes } = model.limits;
+  const total = inputTokens + framingTokens + outputTokens;
+  if (!Number.isSafeInteger(total)) throw new RangeError('invalid request size');
+  return { serialized, inputTokens, fits: inputTokens <= maxRequestBytes && total <= contextTokens };
+}
+
 /** Render only selected non-content metadata and host-resolved evidence. */
 export function renderFinalEvidenceState(article: ContextInput['article'], fields: ContextInput['fields'], evidence: readonly (Omit<ChunkEvidence, 'refs'> & { id: string; refs: ChunkEvidence['refs'] })[]): JsonObject {
   return { ...selectContext(article, { ...fields, includeContent: false }), evidence: evidence.map(item => ({ id: item.id, questionId: item.questionId, polarity: item.polarity, text: item.text, refs: item.refs.map(ref => ({ chunkId: ref.chunkId, start: ref.start, end: ref.end, quote: ref.quote })) })) };

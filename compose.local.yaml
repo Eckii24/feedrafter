@@ -1,0 +1,53 @@
+# Local workstation only. No application authentication; never publish externally.
+name: feedrafter-local
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: feedrafter
+      POSTGRES_PASSWORD: ${LOCAL_DB_PASSWORD:?Set LOCAL_DB_PASSWORD in .env.local}
+      POSTGRES_DB: feedrafter
+    volumes:
+      - db:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U feedrafter -d feedrafter"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://feedrafter:${LOCAL_DB_PASSWORD:?Set LOCAL_DB_PASSWORD in .env.local}@postgres:5432/feedrafter
+      APP_ORIGIN: http://127.0.0.1:${LOCAL_APP_PORT:-3000}
+      HOST: 0.0.0.0
+      PORT: "3000"
+      # Optional local inference; all acknowledgements and caps must be explicitly set.
+      LOCAL_PROCESSING_ENABLED: ${LOCAL_PROCESSING_ENABLED:-false}
+      LOCAL_EXCLUSIVE_DB_ACK: ${LOCAL_EXCLUSIVE_DB_ACK:-false}
+      LOCAL_UNVERIFIED_SIZING_ACK: ${LOCAL_UNVERIFIED_SIZING_ACK:-false}
+      LOCAL_CODEX_COST_ACK: ${LOCAL_CODEX_COST_ACK:-false}
+      LOCAL_CLASSIFIER_DAILY: ${LOCAL_CLASSIFIER_DAILY:-}
+      LOCAL_CLASSIFIER_CONCURRENCY: ${LOCAL_CLASSIFIER_CONCURRENCY:-}
+      LOCAL_AUTOMATIC_DAILY: ${LOCAL_AUTOMATIC_DAILY:-}
+      LOCAL_AUTOMATIC_CONCURRENCY: ${LOCAL_AUTOMATIC_CONCURRENCY:-}
+      TYPESAFE_API_KEY_FILE: /data/pi-auth/typesafe-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${LOCAL_APP_PORT:-3000}:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,uid=1000,gid=1000,mode=1770
+    volumes:
+      - data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    init: true
+    stop_grace_period: 40s
+
+volumes:
+  db:
+  data:

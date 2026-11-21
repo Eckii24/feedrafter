@@ -1,14 +1,14 @@
 import type pg from 'pg';
 import { fallbackCategoryId } from '../../../shared/taxonomy.js';
 import { articleFingerprint, readChainMetadata, readPreparationReceipt, type ChainMetadataV1 } from '../../domain/article-handoff.js';
-import { validateVerifiedModel, type VerifiedModel } from '../../application/score-context-request.js';
+import { copyRequestModel, validateRequestModel, type RequestModel } from '../../application/score-context-request.js';
 
 export type CategoryTaskInput = {
   basis: { taskId: string; executionToken: string; articleId: string; generation: number; prerequisiteId: string | null; contentRevision: number; contentText: string; assignmentRevision: number; catalogEpoch: number; articleInputHash?: string; chainRoot?: ChainMetadataV1 };
   title: string | null;
   content: string | null;
   categories: { id: string; label: string }[];
-  classifier: VerifiedModel;
+  classifier: RequestModel;
   signal: AbortSignal;
 };
 export type CategoryInputResult = { kind: 'loaded'; input: CategoryTaskInput } | { kind: 'stale_basis' } | { kind: 'not_owned' } | { kind: 'configuration_required' } | { kind: 'prerequisite_required' } | { kind: 'missing_selected_content' } | { kind: 'content_not_usable' } | { kind: 'invalid_handoff' };
@@ -17,17 +17,17 @@ export type CategoryInputResult = { kind: 'loaded'; input: CategoryTaskInput } |
 export class CategoryTaskInputStore {
   constructor(private readonly pool: pg.Pool) {}
 
-  async loadResult(taskId: string, executionToken: string, model: VerifiedModel | null, signal: AbortSignal): Promise<CategoryInputResult> {
+  async loadResult(taskId: string, executionToken: string, model: RequestModel | null, signal: AbortSignal): Promise<CategoryInputResult> {
     const stale = { kind: 'stale_basis' } as const;
     const uuid = (v: unknown) => typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v);
     if (!uuid(taskId) || !uuid(executionToken) || !signal || typeof signal.addEventListener !== 'function') return { kind: 'not_owned' };
-    let classifier: VerifiedModel | null = null;
+    let classifier: RequestModel | null = null;
     try {
       if (model) {
-        validateVerifiedModel(model);
-        classifier = { ...model, model: { ...model.model }, limits: { ...model.limits } };
+        validateRequestModel(model);
+        classifier = copyRequestModel(model);
       }
-    } catch { /* Missing verified bounds are configuration, not stale ownership. */ }
+    } catch { /* Missing request bounds are configuration, not stale ownership. */ }
     const client = await this.pool.connect();
     try {
       await client.query('begin isolation level read committed');

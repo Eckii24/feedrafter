@@ -87,6 +87,20 @@ describe('direct score candidate subset', () => {
     expect(result).toEqual({ kind: 'unsupported_chunks' });
     expect(ai.classify).not.toHaveBeenCalled(); expect(ai.generate).not.toHaveBeenCalled();
   });
+  it('bounds local score requests at the exact UTF-8 byte limit', async () => {
+    const input = task(), ai = fake();
+    const local = { kind: 'unverified' as const, model: model.model, limits: { contextTokens: 2000, outputTokens: 20, framingTokens: 10, maxRequestBytes: 1000 } };
+    const localInput = { ...input, article: { ...input.article, title: 'café 😀' }, classifier: local, generator: local };
+    await processContextChunks(localInput, ai);
+    const size = count(JSON.stringify(ai.classify.mock.calls[0]![0]));
+    const exact = fake();
+    await processContextChunks({ ...localInput, classifier: { ...local, limits: { ...local.limits, contextTokens: size + 30, maxRequestBytes: size } } }, exact);
+    expect(exact.classify).toHaveBeenCalledOnce();
+    const tooLarge = fake();
+    expect(await processContextChunks({ ...localInput, classifier: { ...local, limits: { ...local.limits, maxRequestBytes: size - 1 } } }, tooLarge)).toEqual({ kind: 'unsupported_chunks' });
+    expect(tooLarge.classify).not.toHaveBeenCalled();
+    expect(tooLarge.generate).not.toHaveBeenCalled();
+  });
   it('sizes the exact sent shape, including framing and output reserve', async () => {
     const input = task(), ai = fake();
     await processContextChunks(input, ai);
@@ -223,6 +237,27 @@ describe('oversized score evidence', () => {
     ai.generate.mockResolvedValue({ kind: 'completed', value: { text: JSON.stringify({ items: [{ questionIndex: 0, polarity: 'support', text: 'evidence', quotes: [bad] }] }), usage: null } });
     await expect(processContextChunks(input, ai, memoryStore())).rejects.toThrow('invalid evidence quote');
     expect(ai.generate).toHaveBeenCalledTimes(2);
+  });
+  it('plans and dispatches local evidence chunks using byte sizing', async () => {
+    const base = oversized(), ai = fake(), store = memoryStore();
+    const save = vi.spyOn(store, 'save');
+    const local = { kind: 'unverified' as const, model: model.model, limits: { contextTokens: 750, outputTokens: 20, framingTokens: 10, maxRequestBytes: 650 } };
+    ai.generate.mockResolvedValue({ kind: 'completed', value: { text: '{"items":[]}', usage: null } });
+    expect(await processContextChunks({ ...base, generator: local }, ai, store)).toMatchObject({ kind: 'evidence_ready' });
+    expect(ai.generate.mock.calls.length).toBeGreaterThan(1);
+    for (const [request] of ai.generate.mock.calls) expect(count(JSON.stringify(request))).toBeLessThanOrEqual(650);
+    expect(prepareContext(save.mock.calls[0]![1]).basis.sizing).toBe('utf8-bytes');
+  });
+  it('checks local evidence and repair requests separately before inference', async () => {
+    const base = oversized(), ai = fake(), store = memoryStore();
+    const local = { kind: 'unverified' as const, model: model.model, limits: { contextTokens: 750, outputTokens: 20, framingTokens: 10, maxRequestBytes: 650 } };
+    ai.generate.mockImplementationOnce(async request => {
+      expect(count(JSON.stringify(request))).toBeLessThanOrEqual(local.limits.maxRequestBytes);
+      request.user += 'x'.repeat(1000);
+      return { kind: 'completed', value: { text: 'invalid', usage: null } };
+    });
+    await expect(processContextChunks({ ...base, generator: local }, ai, store)).rejects.toThrow('repair request exceeds');
+    expect(ai.generate).toHaveBeenCalledOnce();
   });
   it('repairs invalid evidence with a distinct bounded regular request', async () => {
     const input = oversized(), ai = fake();

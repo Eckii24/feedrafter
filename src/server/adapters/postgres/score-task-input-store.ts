@@ -1,13 +1,13 @@
 import type pg from 'pg';
 import { DEFAULT_PREFERENCE_HALF_LIFE_DAYS, weight, type VoteValue } from '../../domain/preferences.js';
 import type { ScoreContextTask } from '../../application/process-context-chunks.js';
-import { validateVerifiedModel, type VerifiedModel } from '../../application/score-context-request.js';
+import { copyRequestModel, validateRequestModel, type RequestModel } from '../../application/score-context-request.js';
 import { captureScoreHandoff } from './score-handoff.js';
 
 type StoredVote = { value: VoteValue; votedAt: string };
 type StoredWeight = { offset: number; votes: StoredVote[] };
 
-export type ScoreTaskModels = { classifier: VerifiedModel; generator: VerifiedModel };
+export type ScoreTaskModels = { classifier: RequestModel; generator: RequestModel };
 export type ScoreTaskInputResult = { kind: 'loaded'; input: ScoreContextTask } | { kind: 'stale_basis' | 'configuration_required' | 'invalid_handoff' };
 
 /** Captures one owned score task; inference must happen after this method returns. */
@@ -27,8 +27,8 @@ export class ScoreTaskInputStore {
     let capabilities: ScoreTaskModels | null = null;
     try {
       if (models) {
-        validateVerifiedModel(models.classifier); validateVerifiedModel(models.generator);
-        capabilities = { classifier: { ...models.classifier, model: { ...models.classifier.model }, limits: { ...models.classifier.limits } }, generator: { ...models.generator, model: { ...models.generator.model }, limits: { ...models.generator.limits } } };
+        validateRequestModel(models.classifier); validateRequestModel(models.generator);
+        capabilities = { classifier: copyRequestModel(models.classifier), generator: copyRequestModel(models.generator) };
       }
     } catch { /* Invalid capabilities are configuration, not stale ownership. */ }
     const client = await this.pool.connect();

@@ -16,7 +16,8 @@ import type { AiPort } from '../../src/server/ports/ai.js';
 import { fallbackCategoryId } from '../../src/shared/taxonomy.js';
 
 const docker = (...args: string[]) => execFileSync('docker', ['--host', 'unix:///var/run/docker.sock', ...args], { encoding: 'utf8' }).trim();
-const model = (name: string) => ({ model: { provider: 'fake', model: name }, limits: { contextTokens: 10000, outputTokens: 100, framingTokens: 1 }, countTokens: () => 1 });
+// Exercise the same deliberately unverified byte-sizing policy intended for local use.
+const model = (name: string) => ({ kind: 'unverified' as const, model: { provider: 'fake', model: name }, limits: { contextTokens: 100000, outputTokens: 1000, framingTokens: 1000, maxRequestBytes: 90000 } });
 
 export async function eventually(check: () => Promise<boolean>, timeout = 30000) {
   const end = Date.now() + timeout;
@@ -71,10 +72,6 @@ export async function articleProcessingFixture(importArticle?: (database: Return
     }
     const body = Buffer.from(`<html><head><title>Report</title></head><body><article><h1>Report</h1><p>${'A synthetic report with independent details and meaningful factual information. '.repeat(30)}</p></article></body></html>`);
     let preparationFetches = 0;
-    const [processed] = await processExplicitArticles({ db: db.db, boss, web: { async get() { preparationFetches++; return { status: 200, finalUrl: 'https://example.com/article', headers: { 'content-type': 'text/html' }, body }; } }, classifier: { async classify() { return { usable: true, probability: 1 }; } } }, [article]);
-    if (!processed || processed.kind !== 'admission' || processed.admission.kind !== 'admitted') throw new Error(`Processing ${processed?.kind}`);
-    const preparation = { id: processed.prepareTaskId };
-    const admitted = processed.admission;
     const calls: string[] = [];
     let scoreMode: 'initial' | 'changed' | 'failed' = 'initial';
     const ai: AiPort = {
@@ -99,9 +96,17 @@ export async function articleProcessingFixture(importArticle?: (database: Return
     if (!address || typeof address === 'string') throw new Error('No HTTP port');
     const origin = `http://127.0.0.1:${address.port}`;
     await new Promise<void>((resolve, reject) => socket.close(error => error ? reject(error) : resolve()));
-    app = await buildHttpApp({ ...db, origin, trustedProxies: [], scoreAdmission: new ScoreAdmission(db.db, boss) });
-    await app.listen({ host: '127.0.0.1', port: address.port });
     const queue = boss;
+    app = await buildHttpApp({ ...db, origin, trustedProxies: [], scoreAdmission: new ScoreAdmission(db.db, queue),
+      processArticles: ids => processExplicitArticles({ db: db.db, boss: queue, web: { async get() { preparationFetches++; return { status: 200, finalUrl: 'https://example.com/article', headers: { 'content-type': 'text/html' }, body }; } }, classifier: { async classify() { return { usable: true, probability: 1 }; } } }, ids),
+    });
+    await app.listen({ host: '127.0.0.1', port: address.port });
+    const response = await fetch(`${origin}/api/v1/articles/${article}/processing`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+    if (!response.ok) throw new Error(`Processing HTTP ${response.status}`);
+    const processed = await response.json() as { kind: string; prepareTaskId: string; categoryTaskId: string; tagsTaskId: string; scoreTaskIds: string[] };
+    if (processed.kind !== 'admitted') throw new Error(`Processing ${processed.kind}`);
+    const preparation = { id: processed.prepareTaskId };
+    const admitted = { categoryTaskId: processed.categoryTaskId, tagsTaskId: processed.tagsTaskId, scoreTaskIds: processed.scoreTaskIds };
     return { database: db, boss: queue, origin, article, preparation, admitted, target, calls, close,
       get preparationFetches() { return preparationFetches; },
       setScoreMode(mode: typeof scoreMode) { scoreMode = mode; },

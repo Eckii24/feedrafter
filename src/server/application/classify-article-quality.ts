@@ -1,11 +1,11 @@
 import type { AiPort, ClassificationRequest } from '../ports/ai.js';
 import type { ArticleQualityClassifier } from './prepare-article.js';
-import { measureVerifiedRequest, validateVerifiedModel, type VerifiedModel } from './score-context-request.js';
+import { copyRequestModel, measureRequest, validateRequestModel, type RequestModel } from './score-context-request.js';
 
-/** Explicit seam only: the caller must supply verified sizing for the actual classifier. */
-export function createArticleQualityClassifier(ai: Pick<AiPort, 'classify'>, verified: VerifiedModel): ArticleQualityClassifier {
-  validateVerifiedModel(verified);
-  const model: VerifiedModel = { ...verified, model: { ...verified.model }, limits: { ...verified.limits } };
+/** Explicit seam only: the caller must supply a request sizing policy for the actual classifier. */
+export function createArticleQualityClassifier(ai: Pick<AiPort, 'classify'>, policy: RequestModel): ArticleQualityClassifier {
+  validateRequestModel(policy);
+  const model = copyRequestModel(policy);
   return Object.freeze({
     async classify(input: { text: string; sourceUrl: string }, signal: AbortSignal, taskId: string) {
       if (!input || typeof input.text !== 'string' || !input.text.trim() || typeof taskId !== 'string' || !taskId.trim()) throw new RangeError('Invalid quality input');
@@ -14,7 +14,7 @@ export function createArticleQualityClassifier(ai: Pick<AiPort, 'classify'>, ver
         model: { ...model.model }, role: 'quality', state: { text: input.text },
         questions: { usable: { type: 'bool', instructions: 'Is this extracted text usable as the main content of an article?', criteria: { true: 'Usable article content', false: 'Missing or unusable article content' } } },
       };
-      if (!measureVerifiedRequest(model, request).fits) throw new RangeError('Quality request exceeds verified limits');
+      if (!measureRequest(model, request).fits) throw new RangeError(`Quality request exceeds ${'kind' in model ? 'unverified local' : 'verified'} limits`);
       const outcome = await ai.classify(request, { bucket: 'classifier', taskId, signal });
       if (outcome.kind !== 'completed') throw new Error('Quality classifier unavailable');
       const answers = outcome.value.answers;

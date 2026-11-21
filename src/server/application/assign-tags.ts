@@ -3,7 +3,7 @@ import type { TagTaskInputStore } from '../adapters/postgres/tag-task-input-stor
 import type { TagCandidate, TagPublication } from '../adapters/postgres/catalog-store.js';
 import type { TaskStore } from '../adapters/postgres/task-store.js';
 import type { AiPort, GenerationRequest } from '../ports/ai.js';
-import { measureVerifiedRequest, type VerifiedModel } from './score-context-request.js';
+import { measureRequest, type RequestModel } from './score-context-request.js';
 import { UsageAbortError, UsageAttemptError } from './usage.js';
 
 type Result = { kind: 'published' | 'superseded' | 'paused_budget' | 'paused_auth' | 'needs_input' | 'failed' | 'ownership_lost' };
@@ -12,7 +12,7 @@ type Dependencies = {
   catalog: { publishTagCandidate(candidate: TagCandidate, at: Date): Promise<TagPublication | null>; tagKeysFit(labels: string[]): Promise<boolean> };
   tasks: Pick<TaskStore, 'updateOwnedTask'>;
   ai: AiPort;
-  model: VerifiedModel | null;
+  model: RequestModel | null;
   signal: AbortSignal;
   now?: () => Date;
 };
@@ -37,7 +37,7 @@ export async function assignTags(taskId: string, executionToken: string, { input
   if (!content.trim() || basis.contentRevision <= 0) return settle('needs_input', 'missing_selected_content');
   const request: GenerationRequest = { model: generator.model, role: 'tags', system: 'Return only a JSON object with a tags array of at most 10 unique, nonblank tag labels appropriate for this article.', user: JSON.stringify({ title, category, content }) };
   try {
-    if (!measureVerifiedRequest(generator, request).fits) return settle('needs_input', 'context_too_large');
+    if (!measureRequest(generator, request).fits) return settle('needs_input', 'context_too_large');
   } catch { return settle('needs_input', 'configuration_required'); }
   let outcome: Awaited<ReturnType<AiPort['generate']>>;
   try { outcome = await ai.generate(request, { bucket: 'automatic', taskId: basis.taskId, signal }); }

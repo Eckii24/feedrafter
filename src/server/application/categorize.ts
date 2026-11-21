@@ -3,7 +3,7 @@ import type { CategoryTaskInputStore } from '../adapters/postgres/category-task-
 import type { CatalogStore } from '../adapters/postgres/catalog-store.js';
 import type { TaskStore } from '../adapters/postgres/task-store.js';
 import type { AiPort, ClassificationRequest } from '../ports/ai.js';
-import { measureVerifiedRequest, type VerifiedModel } from './score-context-request.js';
+import { measureRequest, type RequestModel } from './score-context-request.js';
 import { UsageAbortError, UsageAttemptError } from './usage.js';
 
 type Result = { kind: 'published' | 'superseded' | 'paused_budget' | 'paused_auth' | 'needs_input' | 'failed' | 'ownership_lost' };
@@ -12,7 +12,7 @@ type Dependencies = {
   catalog: Pick<CatalogStore, 'publishCategoryCandidate'>;
   tasks: Pick<TaskStore, 'updateOwnedTask'>;
   ai: AiPort;
-  model: VerifiedModel | null;
+  model: RequestModel | null;
   signal: AbortSignal;
   now?: () => Date;
 };
@@ -39,7 +39,7 @@ export async function categorize(taskId: string, executionToken: string, { input
   const criteria = Object.fromEntries(categories.map(c => [c.id, c.label]));
   const request: ClassificationRequest = { model: classifier.model, role: 'category', state: { title, content }, questions: { category: { type: 'choice', instructions: 'Choose the most appropriate category for this article.', criteria } } };
   try {
-    if (!measureVerifiedRequest(classifier, request).fits) return settle('needs_input', 'context_too_large');
+    if (!measureRequest(classifier, request).fits) return settle('needs_input', 'context_too_large');
   } catch { return settle('needs_input', 'configuration_required'); }
   let outcome: Awaited<ReturnType<AiPort['classify']>>;
   try { outcome = await ai.classify(request, { bucket: 'classifier', taskId: basis.taskId, signal }); }

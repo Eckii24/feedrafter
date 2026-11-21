@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { measureVerifiedRequest, renderFinalEvidenceState, renderScoreRequest, validateVerifiedModel } from '../../src/server/application/score-context-request.js';
+import { measureRequest, measureVerifiedRequest, renderFinalEvidenceState, renderScoreRequest, requestPlannerLimits, validateRequestModel, validateVerifiedModel } from '../../src/server/application/score-context-request.js';
 
 describe('score request renderer', () => {
   it('preserves the exact classifier envelope and selected state order', () => {
@@ -31,6 +31,21 @@ describe('score request renderer', () => {
   it.each([-1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER])('rejects invalid or overflowing count %s', count => {
     const model = { model: { provider: 'p', model: 'm' }, limits: { contextTokens: 100, outputTokens: 1, framingTokens: 1 }, countTokens: () => count };
     expect(() => measureVerifiedRequest(model, {})).toThrow(/size/);
+  });
+
+  it('uses exact UTF-8 request bytes and independently reserves context, framing and output', () => {
+    const request = { text: '😀"\n' };
+    const size = Buffer.byteLength(JSON.stringify(request));
+    const model = { kind: 'unverified' as const, model: { provider: 'local', model: 'm' }, limits: { contextTokens: size + 7, outputTokens: 4, framingTokens: 3, maxRequestBytes: size } };
+    expect(measureRequest(model, request)).toEqual({ serialized: JSON.stringify(request), inputTokens: size, fits: true });
+    expect(requestPlannerLimits(model).maxInputTokens).toBe(size + 3);
+    expect(measureRequest({ ...model, limits: { ...model.limits, maxRequestBytes: size - 1 } }, request).fits).toBe(false);
+    expect(measureRequest({ ...model, limits: { ...model.limits, contextTokens: size + 6 } }, request).fits).toBe(false);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER])('rejects invalid local byte bound %s', maxRequestBytes => {
+    const model = { kind: 'unverified' as const, model: { provider: 'local', model: 'm' }, limits: { contextTokens: 100, outputTokens: 5, framingTokens: 1, maxRequestBytes } };
+    expect(() => validateRequestModel(model)).toThrow(/limits/);
   });
 
   it('rejects invalid verified limits', () => {

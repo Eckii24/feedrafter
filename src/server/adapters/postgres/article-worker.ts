@@ -2,7 +2,7 @@ import type pg from 'pg';
 import type { PgBoss } from 'pg-boss';
 import { runStoredCategoryTask } from '../../application/run-stored-category-task.js';
 import { runStoredTagTask } from '../../application/run-stored-tag-task.js';
-import type { VerifiedModel } from '../../application/score-context-request.js';
+import type { RequestModel } from '../../application/score-context-request.js';
 import type { AiPort } from '../../ports/ai.js';
 import { ArticleJobs } from './article-jobs.js';
 import { CategoryTaskInputStore } from './category-task-input-store.js';
@@ -22,8 +22,8 @@ export async function provisionArticleQueues(boss: PgBoss): Promise<void> {
 /** Register only; caller owns provisioning and boss lifecycle. */
 export async function startArticleWorkers({ db, pool, boss, ai, resolveCategoryModel, resolveTagModel }: {
   db: Database; pool: pg.Pool; boss: PgBoss; ai: AiPort;
-  resolveCategoryModel: () => Promise<VerifiedModel | null>;
-  resolveTagModel: () => Promise<VerifiedModel | null>;
+  resolveCategoryModel: () => Promise<RequestModel | null>;
+  resolveTagModel: () => Promise<RequestModel | null>;
 }): Promise<{ close(): Promise<void> }> {
   const tasks = new TaskStore(db);
   const catalog = new ArticleJobs(db, boss);

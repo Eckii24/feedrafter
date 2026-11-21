@@ -36,6 +36,17 @@ it('connects a FreshRSS fixture to the real import queue and manually prepared a
   try {
     expect(paths).toEqual(expect.arrayContaining(['/api/greader.php/accounts/ClientLogin', '/api/greader.php/reader/api/0/stream/items/contents']));
     expect(paths.some(path => path.includes('edit-tag'))).toBe(false);
+    const post = (id: string, body = '{}', headers: Record<string, string> = {}) => fetch(`${f.origin}/api/v1/articles/${id}/processing`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body });
+    expect(await (await post(f.article)).json()).toEqual({ kind: 'already_started' });
+    expect((await post(f.article, '{"all":true}')).status).toBe(400);
+    expect((await post(f.article, '{}', { origin: 'https://evil.example' })).status).toBe(403);
+    expect(await (await post('00000000-0000-4000-8000-000000000001')).json()).toEqual({ kind: 'not_found' });
+    expect(f.preparationFetches).toBe(1);
+    // Imported metadata alone must never schedule preparation or inference.
+    const store = new ImportStore(f.database.db);
+    const context = await store.ensureContext('backlog-fixture', 'synthetic');
+    const [backlog] = await store.importPageWithIdentities(context.id, [{ id: 'unselected', title: 'Unselected backlog', url: 'https://example.com/unselected', author: null, publishedAt: null, feedId: null, feedTitle: null }], new Date());
+    if (!backlog) throw new Error('Backlog import failed');
     await f.startWorkers();
     await eventually(async () => {
       const rows = await f.database.pool.query('select state from processing_tasks where id=any($1::uuid[])', [[f.admitted.categoryTaskId, f.admitted.tagsTaskId, ...f.admitted.scoreTaskIds]]);
@@ -43,6 +54,7 @@ it('connects a FreshRSS fixture to the real import queue and manually prepared a
     });
     expect(f.calls).toEqual(['category', 'tags', 'scores']);
     expect(f.preparationFetches).toBe(1);
+    expect((await f.database.pool.query('select id from processing_tasks where article_id=$1', [backlog.id])).rows).toEqual([]);
     expect((await f.database.pool.query('select revision from article_contents where article_id=$1', [f.article])).rows[0].revision).toBe(1);
   } finally { await f.close(); }
 }, 60000);
