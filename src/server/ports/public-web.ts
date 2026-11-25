@@ -17,4 +17,6 @@ export interface PublicWebOptions {
 }
 export interface PublicWeb {
   get(url: string, signal?: AbortSignal, options?: PublicWebOptions): Promise<PublicWebResponse>;
+  /** Bounded, cookie-free JSON POST; redirects are rejected. */
+  postJson?(url: string, data: unknown, signal?: AbortSignal, options?: PublicWebOptions): Promise<PublicWebResponse>;
 }

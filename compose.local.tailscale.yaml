@@ -1,0 +1,5 @@
+# Local Tailscale Serve override; use with compose.local.yaml.
+services:
+  app:
+    environment:
+      APP_ORIGIN: https://hermes-vps.echo-skink.ts.net:3000

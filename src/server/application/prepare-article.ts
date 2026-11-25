@@ -1,3 +1,6 @@
+import { fetchYouTubeTranscript } from '../adapters/web/youtube-transcript.js';
+import { fetchPodcastTranscript } from '../adapters/web/podcast-transcript.js';
+import { QualityClassifierPause } from './classify-article-quality.js';
 import type { ContentExecutionContext, ContentStore } from '../adapters/postgres/content-store.js';
 import { extractHtml } from '../adapters/web/extract.js';
 import { publicUrl } from '../adapters/web/public-url.js';
@@ -25,6 +28,7 @@ type Input = {
   context: ContentExecutionContext;
   originalUrl: string;
   signal?: AbortSignal;
+  allowPreDispatchPause?: boolean;
 };
 const MAX_TEXT = 1_000_000;
 const ACCESS = /\b(?:subscribe to (?:continue|read|access)|subscription required|subscribers only|sign in to (?:continue|read|access)|log in to (?:continue|read|access)|access denied|you do not have permission|payment required|article is behind a paywall)\b/i;
@@ -37,14 +41,15 @@ function bounded<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
     promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
   });
 }
-function assessment(value: unknown): 'usable' | 'uncertain' | 'unusable' {
+function assessment(value: unknown): { quality: 'usable' | 'uncertain' | 'unusable'; sampled: boolean } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_classifier');
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).sort().join(',') !== 'probability,usable' || typeof record.usable !== 'boolean' ||
+  if (!['probability,usable', 'probability,provenance,usable'].includes(Object.keys(record).sort().join(',')) || typeof record.usable !== 'boolean' ||
       typeof record.probability !== 'number' || !Number.isFinite(record.probability) || record.probability < 0 || record.probability > 1) throw new Error('invalid_classifier');
-  if (record.usable && record.probability >= 0.7) return 'usable';
-  if (!record.usable && record.probability < 0.3) return 'unusable';
-  return 'uncertain';
+  const provenance = record.provenance;
+  if (provenance !== undefined && (!provenance || typeof provenance !== 'object' || Array.isArray(provenance) || Object.keys(provenance).sort().join(',') !== 'coverage,method' || (provenance as Record<string, unknown>).coverage !== 'sampled' || (provenance as Record<string, unknown>).method !== 'beginning_middle_end')) throw new Error('invalid_classifier');
+  const quality = record.usable && record.probability >= 0.7 ? 'usable' : !record.usable && record.probability < 0.3 ? 'unusable' : 'uncertain';
+  return { quality, sampled: provenance !== undefined };
 }
 function candidate(value: unknown): { text: string; sourceUrl: string } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('invalid_fallback');
@@ -60,9 +65,29 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
   const now = deps.now ?? (() => new Date());
   const context = { ...input.context };
   let outcome: Parameters<ContentStore['publishTask']>[1];
+  let classificationCompleted = false;
+  const classify = async (value: { text: string; sourceUrl: string }) => {
+    try { return await bounded(deps.classifier.classify(value, signal, context.taskId), signal); }
+    catch (error) {
+      if (error instanceof QualityClassifierPause || signal.aborted) throw error;
+      throw new Error('quality_provider_failed', { cause: error });
+    }
+  };
   try {
     const validatedOriginal = publicUrl(input.originalUrl);
     const originalUrl = validatedOriginal.href;
+    const host = validatedOriginal.hostname.toLowerCase();
+    const youtube = ['youtu.be', 'youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(host);
+    const podcast = ['podcasters.spotify.com', 'creators.spotify.com'].includes(host) && validatedOriginal.pathname.includes('/episodes/');
+    if (youtube || podcast) {
+      const media = youtube ? await fetchYouTubeTranscript(deps.web, originalUrl, signal) : await fetchPodcastTranscript(deps.web, originalUrl, signal);
+      const assessed = assessment(await classify({ text: media.text, sourceUrl: media.sourceUrl }));
+      classificationCompleted = true;
+      if (assessed.quality !== 'usable') throw new Error('content_' + assessed.quality);
+      signal.throwIfAborted();
+      const at = now();
+      outcome = { kind: 'success', at, content: { text: media.text, sourceUrl: media.sourceUrl, quality: 'usable', limitation: `transcript (${media.method}); quality is heuristic${assessed.sampled ? '; quality sampled beginning, middle and end; omitted text not assessed' : ''}`, capturedAt: at } };
+    } else {
     const response = await bounded(deps.web.get(originalUrl, signal), signal);
     if (response.status === 401 || response.status === 403 || response.status === 402) throw new Error('access_denied');
     if (response.status < 200 || response.status >= 300) throw new Error('fetch_failed');
@@ -72,9 +97,10 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
     const extracted = await extractHtml(response.body, signal, { contentType: type });
     if (ACCESS.test(extracted.pageText) || ACCESS.test(extracted.text)) throw new Error('access_denied');
     let result = { text: extracted.text.trim(), sourceUrl: finalUrl };
-    let quality = result.text ? assessment(await bounded(deps.classifier.classify(result, signal, context.taskId), signal)) : 'unusable';
+    let assessed = result.text ? assessment(await classify(result)) : { quality: 'unusable' as const, sampled: false };
+    classificationCompleted = !!result.text;
     let fromFallback = false;
-    if (quality !== 'usable' && deps.fallback) {
+    if (assessed.quality !== 'usable' && deps.fallback) {
       const permission = deps.permission;
       if (!permission || await bounded(permission.resolveForArticle(context.articleId, validatedOriginal.hostname), signal) !== true) throw new Error('fallback_permission_denied');
       const originalHost = normalizePermissionHost(validatedOriginal.hostname);
@@ -123,15 +149,17 @@ export async function prepareArticle(deps: Dependencies, input: Input): Promise<
       if (!fetched.has(result.sourceUrl)) throw new Error('invalid_fallback');
       await authorizeTarget(result.sourceUrl, signal);
       if (ACCESS.test(result.text)) throw new Error('access_denied');
-      quality = assessment(await bounded(deps.classifier.classify(result, signal, context.taskId), signal));
+      assessed = assessment(await classify(result));
       fromFallback = true;
     }
-    if (quality !== 'usable') throw new Error('content_' + quality);
+    if (assessed.quality !== 'usable') throw new Error('content_' + assessed.quality);
     if (signal.aborted) throw signal.reason;
     const at = now();
-    outcome = { kind: 'success', at, content: { text: result.text, sourceUrl: result.sourceUrl, quality: 'usable', limitation: fromFallback ? 'fallback; quality is heuristic' : 'quality is heuristic', capturedAt: at } };
+    outcome = { kind: 'success', at, content: { text: result.text, sourceUrl: result.sourceUrl, quality: 'usable', limitation: (fromFallback ? 'fallback; quality is heuristic' : 'quality is heuristic') + (assessed.sampled ? '; quality sampled beginning, middle and end; omitted text not assessed' : ''), capturedAt: at } };
+    }
   } catch (error) {
-    const allowed = new Set(['invalid_classifier', 'invalid_fallback', 'access_denied', 'fetch_failed', 'not_html', 'unsupported_encoding', 'content_uncertain', 'content_unusable', 'fallback_permission_denied']);
+    if (error instanceof QualityClassifierPause && input.allowPreDispatchPause && !classificationCompleted && !signal.aborted) throw error;
+    const allowed = new Set(['quality_provider_failed', 'invalid_classifier', 'invalid_fallback', 'access_denied', 'fetch_failed', 'not_html', 'unsupported_encoding', 'content_uncertain', 'content_unusable', 'fallback_permission_denied', 'youtube_captions_missing', 'youtube_captions_invalid', 'youtube_fetch_failed', 'podcast_feed_missing', 'podcast_episode_missing', 'podcast_transcript_missing', 'podcast_transcript_invalid', 'podcast_fetch_failed']);
     const message = error instanceof Error ? error.message : '';
     outcome = { kind: 'failure', errorCode: signal.aborted ? 'cancelled_or_timeout' : allowed.has(message) ? message : 'preparation_failed', at: now() };
   }

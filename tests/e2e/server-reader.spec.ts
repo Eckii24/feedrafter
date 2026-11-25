@@ -48,6 +48,7 @@ test('built reader uses the same-origin Fastify and PostgreSQL API', async ({ pa
     app = await buildHttpApp({ db: database.db, pool: database.pool, origin: `http://127.0.0.1:${port}`, trustedProxies: [] });
     await app.listen({ host: '127.0.0.1', port });
     await page.goto(`http://127.0.0.1:${port}/`);
+    await page.getByText('Search & filters').click();
     await expect(page.getByLabel('Sort by')).toHaveValue('date');
     await page.getByLabel('Sort by').selectOption('score');
     await expect(page.getByLabel(/^Score/).getByRole('option', { name: 'Browser rank' })).toHaveCount(1);
@@ -258,6 +259,7 @@ test('built reader uses the same-origin Fastify and PostgreSQL API', async ({ pa
     await page.getByRole('button', { name: 'Mark read' }).click();
     await expect(page.getByRole('button', { name: 'Mark unread' })).toBeVisible();
     await expect(page.getByRole('button', { name: /Real server article/ })).toHaveCount(0);
+    await page.getByText('Search & filters').click();
     await page.getByLabel('Status').selectOption('read');
     await page.getByRole('button', { name: 'Apply filters' }).click();
     await expect(page.getByRole('button', { name: /Real server article/ })).toBeVisible();

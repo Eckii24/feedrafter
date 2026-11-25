@@ -32,10 +32,10 @@ export async function buildApplication(config: AppConfig, overrides?: Parameters
       const jobs = await startImportWorkers(database.pool, database.db, boss!, async id => {
         if (id !== context.id) throw new Error('Unknown import context');
         return fresh;
-      }, [context.id]);
+      }, [context.id], Boolean(local));
       imports = { jobs, contextId: context.id };
     }
-    const app = await buildHttpApp({ db: database.db, pool: database.pool, origin: config.origin, trustedProxies: config.trustedProxies, ...(local ? { processArticles: local.processArticles } : {}), ...(imports ? { imports } : {}), ...(karakeep ? { karakeep } : {}) });
+    const app = await buildHttpApp({ db: database.db, pool: database.pool, origin: config.origin, trustedProxies: config.trustedProxies, ...(local ? { processArticles: local.processArticles, retryPreparation: local.retryPreparation } : {}), ...(imports ? { imports } : {}), ...(karakeep ? { karakeep } : {}) });
     return { app, async close() { if (recovery) clearInterval(recovery); try { await app.close(); } finally { try { await local?.close(); } finally { try { if (boss) await boss.stop({ timeout: 30000 }); } finally { await database.close(); } } } } };
   } catch (error) { if (recovery) clearInterval(recovery); await local?.close().catch(() => {}); if (boss) await boss.stop().catch(() => {}); await database.close(); throw error; }
 }

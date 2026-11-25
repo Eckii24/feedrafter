@@ -83,6 +83,7 @@ test('deleted external score recovers once after SSE invalidation and reconnect'
     return route.fulfill({ json: { items: [article], nextCursor: query.has('cursor') ? null : 'next-page' } });
   });
   await page.goto('/');
+  await page.getByText('Search & filters').click();
   await page.getByLabel('Sort by').selectOption('score');
   await page.getByLabel(/^Score/).selectOption(id);
   await page.getByRole('button', { name: 'Apply filters' }).click();
@@ -128,6 +129,7 @@ test('score cursor 400 retries first page and exposes a repeated 400', async ({ 
     return route.fulfill({ json: { items: [article], nextCursor: 'expired' } });
   });
   await page.goto('/');
+  await page.getByText('Search & filters').click();
   await page.getByLabel('Sort by').selectOption('score');
   await page.getByLabel(/^Score/).selectOption(id);
   await page.getByRole('button', { name: 'Apply filters' }).click();
@@ -160,6 +162,7 @@ test('score recovery reports an unavailable catalog without retrying the article
     return route.fulfill({ json: { items: [article], nextCursor: null } });
   });
   await page.goto('/');
+  await page.getByText('Search & filters').click();
   await page.getByLabel('Sort by').selectOption('score');
   await page.getByLabel(/^Score/).selectOption(id);
   await page.getByRole('button', { name: 'Apply filters' }).click();
@@ -330,6 +333,7 @@ test('filters, paging, safe detail and confirmed read mutation', async ({ page }
   await page.getByRole('button', { name: 'Mark read' }).click();
   await expect(page.getByRole('button', { name: 'Mark unread' })).toBeVisible();
   expect(api.writes).toEqual(['{"isRead":true}']);
+  await page.getByText('Search & filters').click();
   await page.getByLabel('Title search').fill('needle');
   await page.getByLabel('Source ID').fill(source);
   await page.getByLabel('Status').selectOption('all');

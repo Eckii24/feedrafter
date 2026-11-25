@@ -5,8 +5,9 @@ import type { ModelRoleSettings } from '../shared/settings.js';
 import { createPiClassifier, createPiCodexGenerator } from './adapters/pi/runtime.js';
 import { startArticleWorkers } from './adapters/postgres/article-worker.js';
 import type { Database } from './adapters/postgres/client.js';
-import { processExplicitArticles } from './adapters/postgres/explicit-article-processing.js';
+import { processExplicitArticles, retryFailedPreparation } from './adapters/postgres/explicit-article-processing.js';
 import { assertLocalInferenceQueuesEmpty } from './adapters/postgres/local-queue-preflight.js';
+import { startAutomaticImportProcessing } from './adapters/postgres/import-jobs.js';
 import { startScoreWorker } from './adapters/postgres/score-worker.js';
 import { PostgresUsageAdmissionStore } from './adapters/postgres/usage-admission-store.js';
 import { createPublicWeb } from './adapters/web/request.js';
@@ -64,9 +65,14 @@ export async function startLocalProcessing(deps: { db: Database; pool: pg.Pool; 
   const articles = await startArticleWorkers({ db, pool, boss, ai, resolveCategoryModel: async () => c, resolveTagModel: async () => g });
   try {
     const scores = await startScoreWorker({ db, pool, boss, ai, resolveModels: async () => ({ classifier: c, generator: g }) });
-    return {
-      processArticles: (ids: readonly string[]) => processExplicitArticles({ db, boss, web: overrides?.web ?? createPublicWeb(), classifier: quality }, ids),
-      async close() { try { await articles.close(); } finally { await scores.close(); } },
-    };
+    try {
+      const web = overrides?.web ?? createPublicWeb();
+      const automatic = await startAutomaticImportProcessing({ db, pool, boss, web, classifier: quality });
+      return {
+        processArticles: (ids: readonly string[]) => processExplicitArticles({ db, boss, web, classifier: quality }, ids),
+        retryPreparation: (attempts: readonly { articleId: string; failedTaskId: string }[]) => retryFailedPreparation({ db, boss, web, classifier: quality }, attempts),
+        async close() { try { await automatic.close(); } finally { try { await articles.close(); } finally { await scores.close(); } } },
+      };
+    } catch (error) { await scores.close(); throw error; }
   } catch (error) { await articles.close(); throw error; }
 }

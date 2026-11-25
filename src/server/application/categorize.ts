@@ -3,7 +3,8 @@ import type { CategoryTaskInputStore } from '../adapters/postgres/category-task-
 import type { CatalogStore } from '../adapters/postgres/catalog-store.js';
 import type { TaskStore } from '../adapters/postgres/task-store.js';
 import type { AiPort, ClassificationRequest } from '../ports/ai.js';
-import { measureRequest, type RequestModel } from './score-context-request.js';
+import type { RequestModel } from './score-context-request.js';
+import { boundedArticleRequest } from './bounded-article-request.js';
 import { UsageAbortError, UsageAttemptError } from './usage.js';
 
 type Result = { kind: 'published' | 'superseded' | 'paused_budget' | 'paused_auth' | 'needs_input' | 'failed' | 'ownership_lost' };
@@ -37,10 +38,11 @@ export async function categorize(taskId: string, executionToken: string, { input
   const categoryIds = categories.map(c => c.id);
   const allowed = new Set(categoryIds);
   const criteria = Object.fromEntries(categories.map(c => [c.id, c.label]));
-  const request: ClassificationRequest = { model: classifier.model, role: 'category', state: { title, content }, questions: { category: { type: 'choice', instructions: 'Choose the most appropriate category for this article.', criteria } } };
+  let request: ClassificationRequest | null;
   try {
-    if (!measureRequest(classifier, request).fits) return settle('needs_input', 'context_too_large');
+    request = boundedArticleRequest(classifier, content, (text, sampled): ClassificationRequest => ({ model: classifier.model, role: 'category', state: { title, content: text }, questions: { category: { type: 'choice', instructions: sampled ? 'Choose the most appropriate category based only on these excerpts from the beginning, middle and end. Content is omitted; do not assume what the omitted text contains.' : 'Choose the most appropriate category for this article.', criteria } } }));
   } catch { return settle('needs_input', 'configuration_required'); }
+  if (!request) return settle('needs_input', 'context_too_large');
   let outcome: Awaited<ReturnType<AiPort['classify']>>;
   try { outcome = await ai.classify(request, { bucket: 'classifier', taskId: basis.taskId, signal }); }
   catch (error) {

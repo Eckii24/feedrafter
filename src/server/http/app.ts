@@ -22,10 +22,10 @@ import type { Database } from '../adapters/postgres/client.js';
 import type { ImportJobs } from '../adapters/postgres/import-jobs.js';
 import type { KarakeepJobs } from '../adapters/postgres/karakeep-jobs.js';
 import type { ScoreAdmission } from '../adapters/postgres/score-admission.js';
-import type { processExplicitArticles } from '../adapters/postgres/explicit-article-processing.js';
+import type { processExplicitArticles, retryFailedPreparation } from '../adapters/postgres/explicit-article-processing.js';
 import type pg from 'pg';
 
-export interface HttpDependencies { db: Database; pool: pg.Pool; origin: string; trustedProxies: string[]; imports?: { jobs: ImportJobs; contextId: string }; karakeep?: KarakeepJobs; scoreAdmission?: ScoreAdmission; processArticles?: (ids: readonly string[]) => ReturnType<typeof processExplicitArticles> }
+export interface HttpDependencies { db: Database; pool: pg.Pool; origin: string; trustedProxies: string[]; imports?: { jobs: ImportJobs; contextId: string }; karakeep?: KarakeepJobs; scoreAdmission?: ScoreAdmission; processArticles?: (ids: readonly string[]) => ReturnType<typeof processExplicitArticles>; retryPreparation?: (attempts: readonly { articleId: string; failedTaskId: string }[]) => ReturnType<typeof retryFailedPreparation> }
 const uuid = { type: 'string', format: 'uuid' } as const;
 const idParams = { type: 'object', additionalProperties: false, required: ['id'], properties: { id: uuid } } as const;
 const errorSchema = { type: 'object', required: ['error'], properties: { error: { type: 'object', required: ['code', 'message', 'requestId'], properties: { code: { type: 'string' }, message: { type: 'string' }, requestId: { type: 'string' } } } } } as const;
@@ -225,10 +225,37 @@ export async function buildHttpApp(deps: HttpDependencies) {
   app.get<{ Params: { id: string } }>('/api/v1/articles/:id', { schema: { params: idParams, response: { 200: articleSchema, ...commonResponses } } }, async (request, reply) => { const row = await reader.getArticle(request.params.id); return row ? articleDto(row) : reply.code(404).send(notFound(request.id)); });
   app.get<{ Params: { id: string } }>('/api/v1/articles/:id/scores', { schema: { params: idParams, response: { 200: { type: 'object', additionalProperties: false, required: ['items'], properties: { items: { type: 'array', items: scoreResultItem } } }, ...commonResponses } } }, async (request, reply) => (await new ScoreReaderStore(deps.pool).getForReader(request.params.id)) ?? reply.code(404).send(notFound(request.id)));
   app.get<{ Params: { id: string } }>('/api/v1/articles/:id/summary', { schema: { params: idParams, response: { 200: summarySchema, ...commonResponses } } }, async (request, reply) => (await summaries.getForReader(request.params.id)) ?? reply.code(404).send(notFound(request.id)));
-  // Explicit single-article opt-in. Normal composition intentionally leaves this unavailable.
+  // Read task metadata only: result payloads and execution credentials stay private.
+  app.get<{ Params: { id: string } }>('/api/v1/articles/:id/processing', { schema: { params: idParams, response: { 200: { type: 'object', required: ['eligibility', 'tasks'], properties: {
+    eligibility: { enum: ['eligible', 'ineligible', 'already_started', 'unavailable'] },
+    retryFailedTaskId: nullableString,
+    tasks: { type: 'array', items: { type: 'object', required: ['id', 'action', 'generation', 'state', 'errorCode', 'scoreTargetId', 'createdAt', 'updatedAt', 'endedAt'], properties: { id: uuid, action: { enum: ['prepare', 'category', 'tags', 'scores'] }, generation: { type: 'integer' }, state: { type: 'string' }, errorCode: nullableString, scoreTargetId: nullableString, createdAt: { type: 'string' }, updatedAt: { type: 'string' }, endedAt: nullableString } } },
+  } }, ...commonResponses } } }, async (request, reply) => {
+    const result = await deps.pool.query<{ kind: string; url: string | null; content_revision: number; has_content: boolean; has_conflicting_task: boolean; task_id: string | null; action: string; generation: number; state: string; error_code: string | null; score_target_id: string | null; created_at: Date; updated_at: Date; ended_at: Date | null }>(`select a.kind, a.url, a.content_revision, exists(select 1 from article_contents c where c.article_id = a.id) as has_content, exists(select 1 from processing_tasks x where x.article_id = a.id and (x.action in ('category', 'tags', 'scores') or x.state in ('waiting_dependency', 'queued', 'running', 'retry_wait', 'paused_budget', 'paused_auth', 'needs_input'))) as has_conflicting_task, t.id as task_id, t.action, t.generation, t.state, t.error_code, t.score_target_id, t.created_at, t.updated_at, t.ended_at
+      from articles a left join processing_tasks t on t.article_id = a.id and t.action in ('prepare', 'category', 'tags', 'scores')
+      where a.id = $1 order by t.created_at, t.id`, [request.params.id]);
+    const article = result.rows[0];
+    if (!article) return reply.code(404).send(notFound(request.id));
+    const history = result.rows.filter(row => row.task_id !== null).map(row => ({ id: row.task_id, action: row.action, generation: row.generation, state: row.state, errorCode: row.error_code, scoreTargetId: row.score_target_id, createdAt: row.created_at.toISOString(), updatedAt: row.updated_at.toISOString(), endedAt: row.ended_at?.toISOString() ?? null }));
+    const eligibility = !['article', 'video'].includes(article.kind) || !article.url ? 'ineligible' : history.length || article.content_revision !== 0 ? 'already_started' : !deps.processArticles ? 'unavailable' : 'eligible';
+    const prepares = history.filter(task => task.action === 'prepare').sort((a, b) => b.generation - a.generation);
+    const last = prepares[0];
+    const retryFailedTaskId = deps.retryPreparation && ['article', 'video'].includes(article.kind) && article.url && article.content_revision === 0 && !article.has_content && !article.has_conflicting_task && last && last.generation < 2147483647 && prepares.every(task => task.state === 'failed' && task.endedAt && task.generation >= 1) && new Set(prepares.map(task => task.generation)).size === prepares.length ? last.id : null;
+    return { eligibility, retryFailedTaskId, tasks: history };
+  });
+  // Explicit single-article opt-in.
   app.post<{ Params: { id: string } }>('/api/v1/articles/:id/processing', { schema: { params: idParams, body: { type: 'object', additionalProperties: false, maxProperties: 0 }, response: { 200: { type: 'object', required: ['kind'], properties: { kind: { type: 'string' }, prepareTaskId: uuid, categoryTaskId: uuid, tagsTaskId: uuid, scoreTaskIds: { type: 'array', items: uuid } } }, ...commonResponses } } }, async (request, reply) => {
     if (!deps.processArticles) return reply.code(503).send({ error: { code: 'PROCESSING_UNAVAILABLE', message: 'Article processing unavailable', requestId: request.id } });
     const [result] = await deps.processArticles([request.params.id]);
+    if (!result) throw new Error('Missing processing result');
+    if (result.kind === 'admission') return result.admission.kind === 'admitted'
+      ? { kind: 'admitted', prepareTaskId: result.prepareTaskId, categoryTaskId: result.admission.categoryTaskId, tagsTaskId: result.admission.tagsTaskId, scoreTaskIds: result.admission.scoreTaskIds }
+      : { kind: result.admission.kind, prepareTaskId: result.prepareTaskId };
+    return 'prepareTaskId' in result ? { kind: result.kind, prepareTaskId: result.prepareTaskId } : { kind: result.kind };
+  });
+  app.post<{ Params: { id: string }; Body: { failedTaskId: string } }>('/api/v1/articles/:id/processing/retry', { schema: { params: idParams, body: { type: 'object', additionalProperties: false, required: ['failedTaskId'], properties: { failedTaskId: uuid } }, response: { 200: { type: 'object', required: ['kind'], properties: { kind: { type: 'string' }, prepareTaskId: uuid, categoryTaskId: uuid, tagsTaskId: uuid, scoreTaskIds: { type: 'array', items: uuid } } }, ...commonResponses } } }, async (request, reply) => {
+    if (!deps.retryPreparation) return reply.code(503).send({ error: { code: 'PROCESSING_UNAVAILABLE', message: 'Article processing unavailable', requestId: request.id } });
+    const [result] = await deps.retryPreparation([{ articleId: request.params.id, failedTaskId: request.body.failedTaskId }]);
     if (!result) throw new Error('Missing processing result');
     if (result.kind === 'admission') return result.admission.kind === 'admitted'
       ? { kind: 'admitted', prepareTaskId: result.prepareTaskId, categoryTaskId: result.admission.categoryTaskId, tagsTaskId: result.admission.tagsTaskId, scoreTaskIds: result.admission.scoreTaskIds }

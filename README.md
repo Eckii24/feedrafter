@@ -140,14 +140,14 @@ docker compose --env-file .env.local -f compose.local.yaml exec -T postgres psql
 docker compose --env-file .env.local -f compose.local.yaml up -d --force-recreate --wait app
 ```
 
-No inference starts merely by enabling the app or importing metadata. Explicitly select an eligible, first-time article by replacing `ARTICLE-UUID` with its imported ID:
+No inference starts merely by enabling the app. With local processing opted in, newly inserted FreshRSS articles with URLs get durable preparation tasks and are processed automatically; existing imported backlog is not automatically selected. The processing fetches public web content and sends it to the configured providers, subject to the classifier and automatic daily/concurrency caps above. Repeated imports do not retry existing tasks. Explicitly select an eligible, first-time backlog article by replacing `ARTICLE-UUID` with its imported ID:
 
 ```sh
 curl -fsS -X POST http://127.0.0.1:3000/api/v1/articles/ARTICLE-UUID/processing \
   -H 'Content-Type: application/json' -d '{}'
 ```
 
-Normal disabled mode returns 503. The endpoint fetches public web content, sends it to the providers and admits category → tags → active scores. Review privacy and provider terms before use. Existing content or any prior prepare/category/tag/score task makes the article ineligible. A crash, cancellation, budget denial or admission error can leave partial work; there is no automatic retry or takeover. Inspect persisted tasks before proceeding. Score-only reevaluation is unavailable in this runtime. The public web adapter rejects private addresses but cannot establish publisher permission or content correctness.
+Normal disabled mode returns 503. The endpoint fetches public web content, sends it to the providers and admits category → tags → active scores. Review privacy and provider terms before use. Existing content or any prior prepare/category/tag/score task makes the article ineligible. A crash, cancellation, budget denial or admission error can leave partial work; there is no automatic retry or takeover. After the unchanged queue preflight passes, interrupted automatic preparations are marked failed and completed preparations missing their category handoff receive an `admission_interrupted` diagnostic. Inspect persisted tasks before proceeding. If inference queues contain work after a crash or restart, startup still refuses: stop and investigate; there is no supported automatic queue recovery and no jobs are deleted. Score-only reevaluation is unavailable in this runtime. The public web adapter rejects private addresses but cannot establish publisher permission or content correctness. Only public HTML extraction is implemented: PDFs, audio/video, transcripts, paywalled or blocked pages and inaccessible media may fail or contain incomplete information; no transcription or multimedia understanding is implied.
 
 ### Repeatable synthetic product test
 
@@ -159,7 +159,7 @@ mise exec node@24.21.0 -- npm run test:e2e -- tests/e2e/enrichment.spec.ts
 mise exec node@24.21.0 -- ./node_modules/.bin/vitest run tests/integration/explicit-article-processing.test.ts tests/integration/article-processing-api.test.ts tests/integration/freshrss-product-chain.test.ts
 ```
 
-The browser test uses the real Fastify API and persistence, reloads saved category/tags/scores, and exercises score-only reevaluation including failure preservation. The import-chain test uses a locally intercepted FreshRSS protocol fixture and real import jobs, then invokes the explicit single-article HTTP endpoint with an injected processor before starting fake-AI workers. Neither test proves automatic import-to-processing or provider behavior. The fixture ends with the test; it is not a persistent interactive demo. See [verification](docs/verification.md) for tested browser path and remaining gates.
+The browser test uses the real Fastify API and persistence, reloads saved category/tags/scores, and exercises score-only reevaluation including failure preservation. The import-chain test uses a locally intercepted FreshRSS protocol fixture and real import jobs, then invokes the explicit single-article HTTP endpoint with an injected processor before starting fake-AI workers. Additional synthetic integration tests exercise opt-in automatic import and the local application wiring; they do not prove provider behavior. The fixture ends with the test; it is not a persistent interactive demo. See [verification](docs/verification.md) for tested browser path and remaining gates.
 
 ### Local checks and tests
 

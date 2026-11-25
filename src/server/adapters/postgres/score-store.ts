@@ -49,7 +49,7 @@ export class ScoreStore {
     const revision = (value: unknown) => typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= 2147483647;
     if (!basis || ![basis.taskId, basis.executionToken, basis.articleId, basis.scoreId].every(uuid) ||
         ![basis.contentRevision, basis.assignmentRevision, basis.catalogEpoch, basis.generation].every(revision) ||
-        basis.condensed !== false || basis.limited !== false || typeof candidate.value !== 'number' ||
+        typeof basis.condensed !== 'boolean' || typeof basis.limited !== 'boolean' || (basis.condensed && !basis.limited) || typeof candidate.value !== 'number' ||
         !Number.isFinite(candidate.value) || candidate.value < 0 || candidate.value > 100 ||
         !(at instanceof Date) || !Number.isFinite(at.getTime())) return false;
     return this.db.transaction(async tx => {
@@ -74,7 +74,7 @@ export class ScoreStore {
         gt(processingTasks.generation, basis.generation),
       )).limit(1);
       if (newer) return false;
-      const result = { value: candidate.value, calculatedAt: at, contentRevision: basis.contentRevision, assignmentRevision: basis.assignmentRevision, condensed: false, limited: false };
+      const result = { value: candidate.value, calculatedAt: at, contentRevision: basis.contentRevision, assignmentRevision: basis.assignmentRevision, condensed: basis.condensed, limited: basis.limited };
       await tx.insert(articleScores).values({ articleId: article.id, scoreId: definition.id, ...result }).onConflictDoUpdate({
         target: [articleScores.articleId, articleScores.scoreId], set: result,
       });

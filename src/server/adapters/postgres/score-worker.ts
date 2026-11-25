@@ -7,6 +7,7 @@ import { SCORE_QUEUE } from './score-admission.js';
 import { ScoreStore } from './score-store.js';
 import { ScoreTaskInputStore, type ScoreTaskModels } from './score-task-input-store.js';
 import { TaskStore } from './task-store.js';
+import { ContextStore } from './context-store.js';
 
 export type ScoreWorkerDependencies = {
   db: Database;
@@ -21,11 +22,12 @@ export async function startScoreWorker({ db, pool, boss, ai, resolveModels }: Sc
   const inputs = new ScoreTaskInputStore(pool);
   const scores = new ScoreStore(db);
   const tasks = new TaskStore(db);
+  const context = new ContextStore(db);
   const id = await boss.work<{ taskId: string }>(SCORE_QUEUE, { batchSize: 1, localConcurrency: 1 }, async ([job]) => {
     if (!job) return;
     // All returned task outcomes, including obsolete deliveries and pauses, are
     // queue success. Only infrastructure errors escape; admission disables retries.
-    await runStoredScoreTask(job.data.taskId, { ai, inputs, scores, tasks, models: resolveModels, signal: job.signal });
+    await runStoredScoreTask(job.data.taskId, { ai, inputs, scores, tasks, context, models: resolveModels, signal: job.signal });
   });
   return { close: () => boss.offWork(SCORE_QUEUE, { id, wait: true }) };
 }

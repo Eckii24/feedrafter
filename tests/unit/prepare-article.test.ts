@@ -35,6 +35,12 @@ function fixture(body = html(paragraph)) {
 }
 
 describe('article preparation', () => {
+  it('records sampled quality as a limitation rather than assessing omitted passages', async () => {
+    const f = fixture();
+    vi.mocked(f.classifier.classify).mockResolvedValue({ ...usable, provenance: { coverage: 'sampled', method: 'beginning_middle_end' } });
+    expect((await f.run()).status).toBe('succeeded');
+    expect(f.publications[0]).toMatchObject({ kind: 'success', content: { limitation: expect.stringMatching(/sampled.*omitted/i) } });
+  });
   it('extracts original page and publishes the exact fenced context', async () => {
     const f = fixture();
     expect(await f.run()).toEqual({ status: 'succeeded', revision: 5 });

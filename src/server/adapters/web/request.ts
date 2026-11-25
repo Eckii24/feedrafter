@@ -5,7 +5,7 @@ import { isIP } from 'node:net';
 import { Readable, Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createBrotliDecompress, createGunzip, createInflate } from 'node:zlib';
-import type { PublicWeb } from '../../ports/public-web.js';
+import type { PublicWeb, PublicWebOptions } from '../../ports/public-web.js';
 import { isPublicAddress } from './public-address.js';
 import { publicUrl } from './public-url.js';
 
@@ -14,7 +14,7 @@ const DEADLINE = 30_000;
 const REDIRECTS = new Set([301, 302, 303, 307, 308]);
 
 export type ResolverSeam = (hostname: string, signal: AbortSignal) => Promise<string[]>;
-export type TransportSeam = (url: URL, address: string, signal: AbortSignal) => Promise<{
+export type TransportSeam = (url: URL, address: string, signal: AbortSignal, request?: { method: 'POST'; body: string }) => Promise<{
   status: number;
   headers: IncomingHttpHeaders;
   body: Readable;
@@ -36,19 +36,19 @@ async function resolveAll(hostname: string, signal: AbortSignal): Promise<string
 }
 
 /** Single-use socket: lookup cannot resolve again, and Host/SNI remain the URL hostname. */
-export const pinnedTransport: TransportSeam = (url, address, signal) => new Promise((resolve, reject) => {
+export const pinnedTransport: TransportSeam = (url, address, signal, request) => new Promise((resolve, reject) => {
   const family = isIP(address);
   if (!family) { reject(new Error('Invalid pinned address')); return; }
   const req = (url.protocol === 'https:' ? httpsRequest : httpRequest)(url, {
-    method: 'GET', agent: false, signal, family,
-    headers: { 'accept-encoding': 'gzip, deflate, br' },
+    method: request?.method ?? 'GET', agent: false, signal, family,
+    headers: { 'accept-encoding': 'gzip, deflate, br', ...(request ? { 'content-type': 'application/json', 'content-length': Buffer.byteLength(request.body) } : {}) },
     lookup: (_hostname, _options, callback) => callback(null, address, family),
   }, (res: IncomingMessage) => {
     if (!res.statusCode) { res.destroy(); reject(new Error('Missing HTTP status')); return; }
     resolve({ status: res.statusCode, headers: res.headers, body: res });
   });
   req.on('error', reject);
-  req.end();
+  req.end(request?.body);
 });
 
 // The same queue limits all instances and includes DNS, redirects and body processing.
@@ -104,8 +104,7 @@ async function readBody(body: Readable, encoding: string | undefined, signal: Ab
 export function createPublicWeb(options: { resolver?: ResolverSeam; transport?: TransportSeam } = {}): PublicWeb {
   const resolver = options.resolver ?? resolveAll;
   const transport = options.transport ?? pinnedTransport;
-  return {
-    async get(input, callerSignal, limits = {}) {
+  async function run(input: string, callerSignal: AbortSignal | undefined, limits: PublicWebOptions = {}, post?: { method: 'POST'; body: string }) {
       const { maxBytes = LIMIT, timeoutMs = DEADLINE, maxRedirects = 5 } = limits;
       if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > LIMIT ||
           !Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > DEADLINE ||
@@ -122,14 +121,14 @@ export function createPublicWeb(options: { resolver?: ResolverSeam; transport?: 
           signal.throwIfAborted();
           const addresses = await bounded(resolver(url.hostname.replace(/\.$/, ''), signal), signal);
           if (!addresses.length || !addresses.every(isPublicAddress)) throw new Error('Unsafe DNS result');
-          const request = transport(url, addresses[0]!, signal);
+          const request = transport(url, addresses[0]!, signal, post);
           // A misbehaving injected transport may complete after the deadline.
           void request.then(response => { if (signal.aborted) response.body.destroy(); }, () => {});
           const response = await bounded(request, signal);
           if (REDIRECTS.has(response.status)) {
             response.body.destroy();
             const location = response.headers.location;
-            if (!location || redirects >= maxRedirects) throw new Error('Invalid or excessive redirects');
+            if (post || !location || redirects >= maxRedirects) throw new Error('Invalid or excessive redirects');
             const next = publicUrl(location, url);
             if (url.protocol === 'https:' && next.protocol !== 'https:') throw new Error('HTTPS downgrade rejected');
             url = next;
@@ -139,6 +138,13 @@ export function createPublicWeb(options: { resolver?: ResolverSeam; transport?: 
           return { finalUrl: url.href, status: response.status, headers: response.headers, body };
         }
       } finally { clearTimeout(timer); controller.abort(); unlock?.(); }
+    }
+  return {
+    get: (input, signal, limits) => run(input, signal, limits),
+    postJson: (input, data, signal, limits) => {
+      const body = JSON.stringify(data);
+      if (typeof body !== 'string' || Buffer.byteLength(body) > 16_384) throw new Error('Invalid public web request body');
+      return run(input, signal, limits, { method: 'POST', body });
     },
   };
 }

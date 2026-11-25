@@ -207,10 +207,25 @@ export class ArticleJobs extends CatalogStore {
       // Fresh statement after the article lock sees all committed admissions and publications.
       const history = await tx.select().from(processingTasks).where(eq(processingTasks.articleId, article.id))
         .orderBy(processingTasks.id).for('update');
-      // First-time callers may only have their own preparation task, including after concurrent admissions.
-      if (firstTimeOnly && history.some(task => task.id !== prepareTaskId.toLowerCase() &&
-          ['prepare', 'category', 'tags', 'scores'].includes(task.action))) return { kind: 'already_started' as const };
       const prepare = history.find(task => task.id === prepareTaskId.toLowerCase());
+      // Explicit retry is the sole exception to first-time history. Never infer that
+      // failed attempts did not dispatch; preserve and validate every prior task.
+      if (firstTimeOnly) {
+        const others = history.filter(task => task.id !== prepareTaskId.toLowerCase());
+        const relevant = others.filter(task => ['prepare', 'category', 'tags', 'scores'].includes(task.action));
+        if (relevant.length) {
+          const marker = prepare?.result?.explicitPreparationRetry;
+          const prior = relevant.filter(task => task.action === 'prepare').sort((a, b) => b.generation - a.generation);
+          const latest = prior[0];
+          if (!marker || typeof marker !== 'object' || Array.isArray(marker) ||
+              Object.keys(marker).sort().join(',') !== 'previousTaskId,version' ||
+              (marker as Record<string, unknown>).version !== 1 || (marker as Record<string, unknown>).previousTaskId !== latest?.id ||
+              !prepare || !latest || prepare.generation !== latest.generation + 1 ||
+              prior.length !== relevant.length || prior.some(task => task.state !== 'failed' || !task.endedAt || task.generation < 1) ||
+              new Set(prior.map(task => task.generation)).size !== prior.length ||
+              others.some(task => unfinished.includes(task.state))) return { kind: 'already_started' as const };
+        }
+      }
       const receipt = prepare && readPreparationReceipt(prepare.result);
       const [content] = await tx.select().from(articleContents).where(eq(articleContents.articleId, article.id)).for('share');
       if (!prepare || prepare.action !== 'prepare' || prepare.state !== 'succeeded' || !receipt ||

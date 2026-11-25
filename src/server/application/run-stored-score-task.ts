@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ScoreTaskInputStore, ScoreTaskModels } from '../adapters/postgres/score-task-input-store.js';
 import type { ScoreStore } from '../adapters/postgres/score-store.js';
 import type { TaskStore } from '../adapters/postgres/task-store.js';
+import type { ContextStore } from '../adapters/postgres/context-store.js';
 import type { AiPort } from '../ports/ai.js';
 import { runDirectScoreTask, type DirectScoreTaskResult } from './run-direct-score-task.js';
 
@@ -10,13 +11,14 @@ type Dependencies = {
   inputs: Pick<ScoreTaskInputStore, 'loadResult'>;
   scores: Pick<ScoreStore, 'publishCandidate'>;
   tasks: Pick<TaskStore, 'claimTaskForAction' | 'updateOwnedTask'>;
+  context?: Pick<ContextStore, 'save' | 'resume' | 'claimRepair'>;
   models: ScoreTaskModels | null | (() => Promise<ScoreTaskModels | null>);
   signal: AbortSignal;
   now?: () => Date;
 };
 
 /** Execute one persisted task; scheduling and retries belong to a later caller. */
-export async function runStoredScoreTask(taskId: string, { ai, inputs, scores, tasks, models, signal, now = () => new Date() }: Dependencies): Promise<DirectScoreTaskResult | { kind: 'not_claimed' }> {
+export async function runStoredScoreTask(taskId: string, { ai, inputs, scores, tasks, context, models, signal, now = () => new Date() }: Dependencies): Promise<DirectScoreTaskResult | { kind: 'not_claimed' }> {
   const executionToken = randomUUID();
   if (!await tasks.claimTaskForAction(taskId, 'scores', executionToken, now())) return { kind: 'not_claimed' };
   let resolvedModels: ScoreTaskModels | null;
@@ -43,7 +45,7 @@ export async function runStoredScoreTask(taskId: string, { ai, inputs, scores, t
       throw new Error('Score task state update failed');
     }
   }
-  if (loaded.kind === 'loaded') return runDirectScoreTask(loaded.input, { ai, scores, tasks, now });
+  if (loaded.kind === 'loaded') return runDirectScoreTask(loaded.input, { ai, scores, tasks, ...(context ? { context } : {}), now });
   const state = loaded.kind === 'stale_basis' ? 'superseded' : 'needs_input';
   const at = now();
   try {

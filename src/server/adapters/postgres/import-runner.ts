@@ -38,7 +38,7 @@ export async function recoverImports(db: Database, boss: PgBoss, contextIds?: re
 }
 
 export async function startImportWorkers(pool: pg.Pool, db: Database, boss: PgBoss,
-  freshForContext: (contextId: string) => Promise<FreshRssPort>, contextIds?: readonly string[]): Promise<ImportJobs> {
+  freshForContext: (contextId: string) => Promise<FreshRssPort>, contextIds?: readonly string[], automaticProcessing = false): Promise<ImportJobs> {
   const imports = new ImportJobs(db, boss);
   await recoverImports(db, boss, contextIds);
   await boss.work<{ runId: string }>(IMPORT_QUEUE, { localConcurrency: 2, heartbeatRefreshSeconds: 30 }, async ([job]) => {
@@ -46,7 +46,7 @@ export async function startImportWorkers(pool: pg.Pool, db: Database, boss: PgBo
     const rows = await pool.query<{ context_id: string }>('select context_id from processing_runs where id=$1', [job.data.runId]);
     if (!rows.rows[0]) return;
     const contextId = rows.rows[0].context_id;
-    await runImport(pool, job.data.runId, () => freshForContext(contextId), { lastAttempt: job.retryCount >= 2, signal: job.signal });
+    await runImport(pool, job.data.runId, () => freshForContext(contextId), { lastAttempt: job.retryCount >= 2, signal: job.signal, automaticProcessing });
   });
   await boss.work(WAKE_QUEUE, async () => { await recoverImports(db, boss, contextIds); await imports.wakeDue(new Date(), contextIds); });
   await boss.schedule(WAKE_QUEUE, '* * * * *');
